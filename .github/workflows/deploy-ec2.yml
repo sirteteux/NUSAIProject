@@ -1,0 +1,104 @@
+name: Deploy to AWS EC2
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    name: Deploy to EC2
+    runs-on: ubuntu-latest
+    environment:
+      name: production
+      url: http://${{ secrets.EC2_HOST }}:3000
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Deploy to EC2
+        uses: appleboy/ssh-action@v1.0.0
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USER }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          script: |
+            cd /home/ubuntu/hr-microservices
+            
+            # Pull latest code
+            git pull origin main
+            
+            # Create .env if not exists
+            if [ ! -f .env ]; then
+              echo "OPENAI_API_KEY=${{ secrets.OPENAI_API_KEY }}" > .env
+              echo "MONGO_USERNAME=${{ secrets.MONGO_USERNAME }}" >> .env
+              echo "MONGO_PASSWORD=${{ secrets.MONGO_PASSWORD }}" >> .env
+              echo "JWT_SECRET=${{ secrets.JWT_SECRET }}" >> .env
+            fi
+            
+            # Pull latest images and restart
+            docker-compose pull
+            docker-compose down
+            docker-compose up -d
+            
+            # Wait for services
+            sleep 30
+            
+            # Health check
+            curl -f http://localhost:8000/health || exit 1
+
+      - name: Verify Deployment
+        run: |
+          echo "Checking service health..."
+          curl -f http://${{ secrets.EC2_HOST }}:8000/health
+          curl -f http://${{ secrets.EC2_HOST }}:8000/health/services
+
+      - name: Notify Slack
+        if: success()
+        uses: slackapi/slack-github-action@v1.24.0
+        with:
+          payload: |
+            {
+              "text": "✅ HR Microservices deployed successfully to EC2!",
+              "blocks": [
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": "*Deployment Successful* :white_check_mark:\n*Environment:* Production\n*URL:* http://${{ secrets.EC2_HOST }}:3000"
+                  }
+                }
+              ]
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        continue-on-error: true
+
+      - name: Notify on Failure
+        if: failure()
+        uses: slackapi/slack-github-action@v1.24.0
+        with:
+          payload: |
+            {
+              "text": "❌ HR Microservices deployment failed!",
+              "blocks": [
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": "*Deployment Failed* :x:\n*Environment:* Production\n*Check:* https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+                  }
+                }
+              ]
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        continue-on-error: true

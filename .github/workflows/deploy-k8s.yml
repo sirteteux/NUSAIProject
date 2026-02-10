@@ -1,0 +1,112 @@
+name: Deploy to Kubernetes
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_PREFIX: ${{ github.repository }}
+
+jobs:
+  deploy:
+    name: Deploy to K8s
+    runs-on: ubuntu-latest
+    environment:
+      name: production
+      url: https://hr-microservices.your-domain.com
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (for EKS)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Configure kubectl
+        run: |
+          aws eks update-kubeconfig --name ${{ secrets.EKS_CLUSTER_NAME }} --region ${{ secrets.AWS_REGION }}
+
+      - name: Create/Update Secrets
+        run: |
+          kubectl create secret generic hr-secrets \
+            --from-literal=openai-api-key=${{ secrets.OPENAI_API_KEY }} \
+            --from-literal=mongodb-uri=${{ secrets.MONGODB_URI }} \
+            --from-literal=jwt-secret=${{ secrets.JWT_SECRET }} \
+            --dry-run=client -o yaml | kubectl apply -f -
+
+      - name: Deploy API Gateway
+        run: |
+          kubectl set image deployment/api-gateway \
+            api-gateway=${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}/api-gateway:latest
+          kubectl rollout status deployment/api-gateway
+
+      - name: Deploy Auth Service
+        run: |
+          kubectl set image deployment/auth-service \
+            auth-service=${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}/auth-service:latest
+          kubectl rollout status deployment/auth-service
+
+      - name: Deploy FAQ Service
+        run: |
+          kubectl set image deployment/faq-service \
+            faq-service=${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}/faq-service:latest
+          kubectl rollout status deployment/faq-service
+
+      - name: Deploy Payroll Service
+        run: |
+          kubectl set image deployment/payroll-service \
+            payroll-service=${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}/payroll-service:latest
+          kubectl rollout status deployment/payroll-service
+
+      - name: Deploy Leave Service
+        run: |
+          kubectl set image deployment/leave-service \
+            leave-service=${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}/leave-service:latest
+          kubectl rollout status deployment/leave-service
+
+      - name: Deploy Recruitment Service
+        run: |
+          kubectl set image deployment/recruitment-service \
+            recruitment-service=${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}/recruitment-service:latest
+          kubectl rollout status deployment/recruitment-service
+
+      - name: Deploy Performance Service
+        run: |
+          kubectl set image deployment/performance-service \
+            performance-service=${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}/performance-service:latest
+          kubectl rollout status deployment/performance-service
+
+      - name: Deploy Coordinator Service
+        run: |
+          kubectl set image deployment/coordinator-service \
+            coordinator-service=${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}/coordinator-service:latest
+          kubectl rollout status deployment/coordinator-service
+
+      - name: Deploy Frontend
+        run: |
+          kubectl set image deployment/frontend \
+            frontend=${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}/frontend:latest
+          kubectl rollout status deployment/frontend
+
+      - name: Verify Deployments
+        run: |
+          kubectl get deployments
+          kubectl get services
+          kubectl get pods
+
+      - name: Health Check
+        run: |
+          GATEWAY_URL=$(kubectl get service api-gateway -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
+          echo "Checking health at http://${GATEWAY_URL}/health"
+          sleep 30
+          curl -f http://${GATEWAY_URL}/health
+
+      - name: Notify Success
+        if: success()
+        run: echo "✅ All services deployed successfully to Kubernetes!"

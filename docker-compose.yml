@@ -74,10 +74,11 @@ services:
       interval: 30s
       timeout: 10s
       retries: 3
+      start_period: 40s
 
   # ==================== MICROSERVICES ====================
   
-  # Auth Service
+  # Auth Service (Node.js)
   auth-service:
     build:
       context: ./services/auth-service
@@ -98,12 +99,13 @@ services:
     networks:
       - microservices-network
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8001/health"]
+      test: ["CMD", "node", "-e", "require('http').get('http://localhost:8001/health', (r) => {process.exit(r.statusCode === 200 ? 0 : 1)})"]
       interval: 30s
       timeout: 10s
       retries: 3
+      start_period: 40s
 
-  # FAQ Service
+  # FAQ Service (Python)
   faq-service:
     build:
       context: ./services/faq-service
@@ -122,12 +124,13 @@ services:
     networks:
       - microservices-network
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8002/health"]
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8002/health')"]
       interval: 30s
       timeout: 10s
       retries: 3
+      start_period: 40s
 
-  # Payroll Service
+  # Payroll Service (Python)
   payroll-service:
     build:
       context: ./services/payroll-service
@@ -146,12 +149,13 @@ services:
     networks:
       - microservices-network
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8003/health"]
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8003/health')"]
       interval: 30s
       timeout: 10s
       retries: 3
+      start_period: 40s
 
-  # Leave Service
+  # Leave Service (Python)
   leave-service:
     build:
       context: ./services/leave-service
@@ -170,12 +174,13 @@ services:
     networks:
       - microservices-network
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8004/health"]
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8004/health')"]
       interval: 30s
       timeout: 10s
       retries: 3
+      start_period: 40s
 
-  # Recruitment Service
+  # Recruitment Service (Python)
   recruitment-service:
     build:
       context: ./services/recruitment-service
@@ -194,12 +199,13 @@ services:
     networks:
       - microservices-network
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8005/health"]
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8005/health')"]
       interval: 30s
       timeout: 10s
       retries: 3
+      start_period: 40s
 
-  # Performance Service
+  # Performance Service (Python)
   performance-service:
     build:
       context: ./services/performance-service
@@ -218,12 +224,13 @@ services:
     networks:
       - microservices-network
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8006/health"]
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8006/health')"]
       interval: 30s
       timeout: 10s
       retries: 3
+      start_period: 40s
 
-  # Coordinator Service
+  # Coordinator Service (Python)
   coordinator-service:
     build:
       context: ./services/coordinator-service
@@ -257,10 +264,11 @@ services:
     networks:
       - microservices-network
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8007/health"]
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8007/health')"]
       interval: 30s
       timeout: 10s
       retries: 3
+      start_period: 40s
 
   # ==================== FRONTEND ====================
   

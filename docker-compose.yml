@@ -1,31 +1,11 @@
 version: '3.8'
 
-# HR Microservices Architecture
-# Complete microservices setup with API Gateway
+# HR Microservices - No Separate Auth Service
+# Authentication integrated into API Gateway
 
 services:
   # ==================== INFRASTRUCTURE ====================
   
-  # MongoDB - Shared database (can be split per service later)
-  mongodb:
-    image: mongo:7.0
-    container_name: mongodb
-    restart: always
-    ports:
-      - "27017:27017"
-    environment:
-      MONGO_INITDB_ROOT_USERNAME: ${MONGO_USERNAME:-admin}
-      MONGO_INITDB_ROOT_PASSWORD: ${MONGO_PASSWORD:-securepassword123}
-    volumes:
-      - mongodb_data:/data/db
-    networks:
-      - microservices-network
-    healthcheck:
-      test: echo 'db.runCommand("ping").ok' | mongosh localhost:27017/test --quiet
-      interval: 10s
-      timeout: 5s
-      retries: 5
-
   # Redis - Caching and session storage
   redis:
     image: redis:7-alpine
@@ -43,7 +23,7 @@ services:
       timeout: 5s
       retries: 5
 
-  # ==================== API GATEWAY ====================
+  # ==================== API GATEWAY (With Auth) ====================
   
   api-gateway:
     build:
@@ -56,8 +36,10 @@ services:
     environment:
       - PORT=8000
       - NODE_ENV=${NODE_ENV:-development}
+      - MONGODB_URI=${MONGODB_URI}
+      - JWT_SECRET=${JWT_SECRET:-your-jwt-secret-change-in-production}
+      - JWT_EXPIRY=7d
       - FRONTEND_URL=${FRONTEND_URL:-http://localhost:3000}
-      - AUTH_SERVICE_URL=http://auth-service:8001
       - FAQ_SERVICE_URL=http://faq-service:8002
       - PAYROLL_SERVICE_URL=http://payroll-service:8003
       - LEAVE_SERVICE_URL=http://leave-service:8004
@@ -65,7 +47,6 @@ services:
       - PERFORMANCE_SERVICE_URL=http://performance-service:8006
       - COORDINATOR_SERVICE_URL=http://coordinator-service:8007
     depends_on:
-      - auth-service
       - coordinator-service
     networks:
       - microservices-network
@@ -74,38 +55,10 @@ services:
       interval: 30s
       timeout: 10s
       retries: 3
-      start_period: 40s
 
-  # ==================== MICROSERVICES ====================
+  # ==================== AI MICROSERVICES ====================
   
-  # Auth Service (Node.js)
-  auth-service:
-    build:
-      context: ./services/auth-service
-      dockerfile: Dockerfile
-    container_name: auth-service
-    restart: always
-    ports:
-      - "8001:8001"
-    environment:
-      - PORT=8001
-      - NODE_ENV=${NODE_ENV:-development}
-      - MONGODB_URI=mongodb://${MONGO_USERNAME:-admin}:${MONGO_PASSWORD:-securepassword123}@mongodb:27017/auth_db?authSource=admin
-      - JWT_SECRET=${JWT_SECRET:-your-jwt-secret-change-in-production}
-      - JWT_EXPIRY=7d
-    depends_on:
-      mongodb:
-        condition: service_healthy
-    networks:
-      - microservices-network
-    healthcheck:
-      test: ["CMD", "node", "-e", "require('http').get('http://localhost:8001/health', (r) => {process.exit(r.statusCode === 200 ? 0 : 1)})"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 40s
-
-  # FAQ Service (Python)
+  # FAQ Service
   faq-service:
     build:
       context: ./services/faq-service
@@ -117,20 +70,17 @@ services:
     environment:
       - PORT=8002
       - OPENAI_API_KEY=${OPENAI_API_KEY}
-      - DATABASE_URL=mongodb://${MONGO_USERNAME:-admin}:${MONGO_PASSWORD:-securepassword123}@mongodb:27017/faq_db?authSource=admin
-    depends_on:
-      mongodb:
-        condition: service_healthy
+      - DATABASE_URL=${MONGODB_URI}
     networks:
       - microservices-network
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8002/health')"]
+      test: ["CMD", "curl", "-f", "http://localhost:8002/health"]
       interval: 30s
       timeout: 10s
       retries: 3
       start_period: 40s
 
-  # Payroll Service (Python)
+  # Payroll Service
   payroll-service:
     build:
       context: ./services/payroll-service
@@ -142,20 +92,17 @@ services:
     environment:
       - PORT=8003
       - OPENAI_API_KEY=${OPENAI_API_KEY}
-      - DATABASE_URL=mongodb://${MONGO_USERNAME:-admin}:${MONGO_PASSWORD:-securepassword123}@mongodb:27017/payroll_db?authSource=admin
-    depends_on:
-      mongodb:
-        condition: service_healthy
+      - DATABASE_URL=${MONGODB_URI}
     networks:
       - microservices-network
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8003/health')"]
+      test: ["CMD", "curl", "-f", "http://localhost:8003/health"]
       interval: 30s
       timeout: 10s
       retries: 3
       start_period: 40s
 
-  # Leave Service (Python)
+  # Leave Service
   leave-service:
     build:
       context: ./services/leave-service
@@ -167,20 +114,17 @@ services:
     environment:
       - PORT=8004
       - OPENAI_API_KEY=${OPENAI_API_KEY}
-      - DATABASE_URL=mongodb://${MONGO_USERNAME:-admin}:${MONGO_PASSWORD:-securepassword123}@mongodb:27017/leave_db?authSource=admin
-    depends_on:
-      mongodb:
-        condition: service_healthy
+      - DATABASE_URL=${MONGODB_URI}
     networks:
       - microservices-network
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8004/health')"]
+      test: ["CMD", "curl", "-f", "http://localhost:8004/health"]
       interval: 30s
       timeout: 10s
       retries: 3
       start_period: 40s
 
-  # Recruitment Service (Python)
+  # Recruitment Service
   recruitment-service:
     build:
       context: ./services/recruitment-service
@@ -192,20 +136,17 @@ services:
     environment:
       - PORT=8005
       - OPENAI_API_KEY=${OPENAI_API_KEY}
-      - DATABASE_URL=mongodb://${MONGO_USERNAME:-admin}:${MONGO_PASSWORD:-securepassword123}@mongodb:27017/recruitment_db?authSource=admin
-    depends_on:
-      mongodb:
-        condition: service_healthy
+      - DATABASE_URL=${MONGODB_URI}
     networks:
       - microservices-network
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8005/health')"]
+      test: ["CMD", "curl", "-f", "http://localhost:8005/health"]
       interval: 30s
       timeout: 10s
       retries: 3
       start_period: 40s
 
-  # Performance Service (Python)
+  # Performance Service
   performance-service:
     build:
       context: ./services/performance-service
@@ -217,20 +158,17 @@ services:
     environment:
       - PORT=8006
       - OPENAI_API_KEY=${OPENAI_API_KEY}
-      - DATABASE_URL=mongodb://${MONGO_USERNAME:-admin}:${MONGO_PASSWORD:-securepassword123}@mongodb:27017/performance_db?authSource=admin
-    depends_on:
-      mongodb:
-        condition: service_healthy
+      - DATABASE_URL=${MONGODB_URI}
     networks:
       - microservices-network
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8006/health')"]
+      test: ["CMD", "curl", "-f", "http://localhost:8006/health"]
       interval: 30s
       timeout: 10s
       retries: 3
       start_period: 40s
 
-  # Coordinator Service (Python)
+  # Coordinator Service
   coordinator-service:
     build:
       context: ./services/coordinator-service
@@ -252,19 +190,19 @@ services:
       redis:
         condition: service_healthy
       faq-service:
-        condition: service_healthy
+        condition: service_started
       payroll-service:
-        condition: service_healthy
+        condition: service_started
       leave-service:
-        condition: service_healthy
+        condition: service_started
       recruitment-service:
-        condition: service_healthy
+        condition: service_started
       performance-service:
-        condition: service_healthy
+        condition: service_started
     networks:
       - microservices-network
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8007/health')"]
+      test: ["CMD", "curl", "-f", "http://localhost:8007/health"]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -276,6 +214,8 @@ services:
     build:
       context: ./frontend
       dockerfile: Dockerfile
+      args:
+        VITE_API_GATEWAY_URL: http://localhost:8000
     container_name: frontend
     restart: always
     ports:
@@ -283,8 +223,7 @@ services:
     environment:
       - VITE_API_GATEWAY_URL=http://localhost:8000
     depends_on:
-      api-gateway:
-        condition: service_healthy
+      - api-gateway
     networks:
       - microservices-network
 
@@ -298,7 +237,5 @@ networks:
 # ==================== VOLUMES ====================
 
 volumes:
-  mongodb_data:
-    driver: local
   redis_data:
     driver: local

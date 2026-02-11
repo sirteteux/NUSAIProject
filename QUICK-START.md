@@ -1,37 +1,51 @@
 # 🚀 Quick Start - HR Microservices
 
 ## ⚡ 5-Minute Setup
-
+---------------------------------------------
 ### Prerequisites
 ```bash
 ✓ Docker & Docker Compose installed
 ✓ 8GB+ RAM
 ✓ OpenAI API Key
-```
-
+---------------------------------------------
 ### Step 1: Create Environment File
-```bash
 cd hr-microservices
 
 # Copy example
 cp .env.example .env
 
-# Edit and add your OpenAI API key
-nano .env  # or use any editor
-```
+----------------------------
+SETTING UP .ENV
+----------------------------
+Place the .env in your services folder and HR-Microservices folder
 
-Add this to `.env`:
-```bash
-OPENAI_API_KEY=sk-your-actual-openai-key-here
-MONGO_USERNAME=admin
-MONGO_PASSWORD=securepassword123
-JWT_SECRET=your-super-secret-jwt-key
-```
+----------------------------
+Configuration
+----------------------------
+Go to your services\coordinator-service
+Edit requirements.txt to below:
+fastapi==0.109.0
+uvicorn[standard]==0.27.0
+pydantic>=2.5.3
+python-dotenv==1.0.0
+openai==1.12.0
+httpx>=0.27,<0.28
 
-### Step 2: Start All Services
-```bash
-# Build and start everything
-docker-compose up --build -d
+---------------------------
+INSTALLATION
+---------------------------
+cd frontend
+npm install
+Open new terminal and cd services\api-gateway
+npm install
+Open new terminal and cd services\auth-service
+npm install
+cd services\coordinator-service
+pip install -r requirements.txt
+pip install pytest pytest-asyncio
+Do testing by running "python -m pytest tests/"
+Open new terminal
+Run "docker-compose up -d"
 
 # This starts:
 # - MongoDB (database)
@@ -39,17 +53,14 @@ docker-compose up --build -d
 # - API Gateway (:8000)
 # - 7 Microservices (:8001-8007)
 # - Frontend (:3000)
-```
-
+-------------------------------------------------
 ### Step 3: Wait for Services (2-3 minutes)
-```bash
 # Watch logs
 docker-compose logs -f
 
 # Or check status
 docker-compose ps
-```
-
+--------------------------------------------------
 ### Step 4: Verify Everything Works
 ```bash
 # Check API Gateway
@@ -59,18 +70,14 @@ curl http://localhost:8000/health
 curl http://localhost:8000/health/services
 
 # Should see all services "healthy"
-```
-
+---------------------------------------------
 ### Step 5: Access the Application
-```
 Open browser: http://localhost:3000
 
 Default login:
 Email: admin@example.com
 Password: admin123
-```
-
----
+-------------------------------------------------
 
 ## 🎯 Service Ports
 
@@ -88,15 +95,14 @@ Password: admin123
 | **MongoDB** | 27017 | mongodb://localhost:27017 |
 | **Redis** | 6379 | redis://localhost:6379 |
 
----
+-----------------------------------------------------------------------------------
 
 ## 🧪 Testing the System
 
 ### 1. Test API Gateway
 ```bash
 curl http://localhost:8000/api/docs
-```
-
+-----------------------------------------------------------------------------------
 ### 2. Test Login
 ```bash
 curl -X POST http://localhost:8000/api/auth/login \
@@ -105,12 +111,10 @@ curl -X POST http://localhost:8000/api/auth/login \
     "email": "admin@example.com",
     "password": "admin123"
   }'
-```
 
 Save the token from response!
-
+-----------------------------------------------------------------------------------
 ### 3. Test Coordinator (with token)
-```bash
 TOKEN="your-token-here"
 
 curl -X POST http://localhost:8000/api/coordinator/ask \
@@ -121,7 +125,7 @@ curl -X POST http://localhost:8000/api/coordinator/ask \
     "employee_id": "EMP000001"
   }'
 ```
-
+-----------------------------------------------------------------------------------
 ### 4. Test Direct FAQ Service
 ```bash
 curl -X POST http://localhost:8000/api/faq/ask \
@@ -131,8 +135,7 @@ curl -X POST http://localhost:8000/api/faq/ask \
     "question": "What are the working hours?"
   }'
 ```
-
----
+-----------------------------------------------------------------------------------
 
 ## 📊 View Logs
 
@@ -237,7 +240,7 @@ docker-compose logs frontend
 # Check browser console for errors
 ```
 
----
+-----------------------------------------------------------------------------------
 
 ## 📁 Project Structure
 
@@ -260,7 +263,7 @@ hr-microservices/
 └── .env                   # Configuration
 ```
 
----
+-----------------------------------------------------------------------------------
 
 ## 🎓 Next Steps
 
@@ -290,7 +293,7 @@ hr-microservices/
    - Modify services
    - Add new features
 
----
+-----------------------------------------------------------------------------------
 
 ## 🆘 Get Help
 
@@ -317,7 +320,7 @@ docker-compose up faq-service
 curl http://localhost:8002/health
 ```
 
----
+-----------------------------------------------------------------------------------
 
 ## ✅ Success Checklist
 
@@ -331,7 +334,7 @@ After setup, you should have:
 - [ ] Can ask questions via Coordinator
 - [ ] All logs showing no errors
 
----
+-----------------------------------------------------------------------------------
 
 **You're now running a production-grade microservices architecture! 🎉**
 

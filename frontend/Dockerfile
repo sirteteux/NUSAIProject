@@ -6,13 +6,23 @@ WORKDIR /app
 COPY package*.json ./
 
 # Install dependencies
-RUN npm install
+RUN npm ci
 
-# Copy application code
+# Copy source code
 COPY . .
+
+# Build-time argument for API Gateway URL
+ARG VITE_API_GATEWAY_URL=http://localhost:8000
+ENV VITE_API_GATEWAY_URL=$VITE_API_GATEWAY_URL
+
+# Build the application
+RUN npm run build
+
+# Install serve to run the built app
+RUN npm install -g serve
 
 # Expose port
 EXPOSE 3000
 
-# Start development server
-CMD ["npm", "run", "dev", "--", "--host"]
+# Start the application
+CMD ["serve", "-s", "dist", "-l", "3000"]

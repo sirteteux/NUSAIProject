@@ -48,6 +48,8 @@ services:
       - COORDINATOR_SERVICE_URL=http://coordinator-service:8007
     depends_on:
       - coordinator-service
+      - faq-service
+      - payroll-service
     networks:
       - microservices-network
     healthcheck:

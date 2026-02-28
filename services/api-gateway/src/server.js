@@ -257,31 +257,49 @@ app.put('/api/auth/profile', authenticateToken, async (req, res) => {
 // ==================== SERVICE PROXYING ====================
 
 const createServiceProxy = (target, pathRewrite = {}) => {
+  console.log("gg");
   return createProxyMiddleware({
     target,
     changeOrigin: true,
     pathRewrite,
+    timeout: 120000,
+    proxyTimeout: 120000,
+    
     onProxyReq: (proxyReq, req, res) => {
+      const requestId = req.headers['x-request-id'] || `${Date.now()}-${Math.random()}`;
+      
+      console.log(`[${requestId}] ${req.method} ${req.path} → ${target}`);
+      
+      // Set headers FIRST (before any write)
       if (req.headers.authorization) {
         proxyReq.setHeader('Authorization', req.headers.authorization);
       }
-      
-      const requestId = req.headers['x-request-id'] || `${Date.now()}-${Math.random()}`;
       proxyReq.setHeader('X-Request-ID', requestId);
       
-      console.log(`[${requestId}] ${req.method} ${req.path} → ${target}`);
+      // Then handle body for POST/PUT/PATCH
+      if (req.body && (req.method === 'POST' || req.method === 'PUT' || req.method === 'PATCH')) {
+        const bodyData = JSON.stringify(req.body);
+        proxyReq.setHeader('Content-Type', 'application/json');
+        proxyReq.setHeader('Content-Length', Buffer.byteLength(bodyData));
+        proxyReq.write(bodyData);
+        // DON'T call proxyReq.end() - let the proxy handle it
+      }
     },
+    
     onProxyRes: (proxyRes, req, res) => {
       const requestId = req.headers['x-request-id'];
       console.log(`[${requestId}] ${proxyRes.statusCode} ← ${req.path}`);
     },
+    
     onError: (err, req, res) => {
       console.error(`Proxy error: ${err.message}`);
-      res.status(503).json({
-        error: 'Service Unavailable',
-        message: 'The requested service is temporarily unavailable',
-        service: req.path.split('/')[2]
-      });
+      if (!res.headersSent) {
+        res.status(503).json({
+          error: 'Service Unavailable',
+          message: 'The requested service is temporarily unavailable',
+          service: req.path.split('/')[2]
+        });
+      }
     }
   });
 };

@@ -46,11 +46,11 @@ else:
     logger.info(f"✅ OpenAI API Key configured")
 
 # Agent URLs
-FAQ_URL = os.getenv("FAQ_URL", "http://faq-agent:8002")
-PAYROLL_URL = os.getenv("PAYROLL_URL", "http://payroll-agent:8003")
-LEAVE_URL = os.getenv("LEAVE_URL", "http://leave-agent:8004")
-RECRUITMENT_URL = os.getenv("RECRUITMENT_URL", "http://recruitment-agent:8005")
-PERFORMANCE_URL = os.getenv("PERFORMANCE_URL", "http://performance-agent:8006")
+FAQ_URL = os.getenv("FAQ_SERVICE_URL", "http://localhost:8002")
+PAYROLL_URL = os.getenv("PAYROLL_SERVICE_URL", "http://localhost:8003")
+LEAVE_URL = os.getenv("LEAVE_SERVICE_URL", "http://localhost:8004")
+RECRUITMENT_URL = os.getenv("RECRUITMENT_SERVICE_URL", "http://localhost:8005")
+PERFORMANCE_URL = os.getenv("PERFORMANCE_SERVICE_URL", "http://localhost:8006")
 
 # Models
 class CoordinatorRequest(BaseModel):

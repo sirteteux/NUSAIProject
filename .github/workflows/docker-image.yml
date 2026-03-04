@@ -38,7 +38,7 @@ jobs:
           username: ${{ secrets.EC2_USER }}
           key: ${{ secrets.SSH_PRIVATE_KEY }}
           script: |
-            cd /path/to/your/app/on/ec2 # Navigate to your application directory on the EC2 instance
+            cd /home/ec2-user # Navigate to your application directory on the EC2 instance
             # Pull the latest images and restart containers
             docker compose pull
             docker compose down

@@ -10,6 +10,7 @@ const Payroll = () => {
   const [conversation, setConversation] = useState([]);
   const [loading, setLoading] = useState(false);
   const [history, setHistory] = useState([]);
+  const employeeId = user?.employee_id;
 
   useEffect(() => {
     loadHistory();
@@ -17,7 +18,7 @@ const Payroll = () => {
 
   const loadHistory = async () => {
     try {
-      const response = await payrollAPI.getHistory();
+      const response = await payrollAPI.getHistory(employeeId);
       setHistory(response.data.history || []);
     } catch (error) {
       console.error('Failed to load history');

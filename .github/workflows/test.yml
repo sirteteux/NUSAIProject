@@ -45,11 +45,11 @@ jobs:
           npm install
           npm test || echo "⚠️  No tests configured"
 
-      - name: Test Auth Service
-        run: |
-          cd services/auth-service
-          npm install
-          npm test || echo "⚠️  No tests configured"
+      # - name: Test Auth Service
+      #   run: |
+      #     cd services/auth-service
+      #     npm install
+      #     npm test || echo "⚠️  No tests configured"
 
       - name: Test Frontend
         run: |

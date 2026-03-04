@@ -29,5 +29,4 @@ jobs:
       - name: Build and push with commit hash tag
         run: |
           docker compose build
-          docker tag ci-cd-pipeline-prod ${{ secrets.DOCKERHUB_USERNAME }}/nus_ai_proj:${{ steps.vars.outputs.sha_short }}
           docker push ${{ secrets.DOCKERHUB_USERNAME }}/nus_ai_proj:${{ steps.vars.outputs.sha_short }}

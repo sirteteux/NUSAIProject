@@ -57,13 +57,15 @@ export const recruitmentAPI = {
   getOpening: (id) => api.get(`/api/recruitment/opening/${id}`),
 };
 
+
 export const performanceAPI = {
-  query: (query) => api.post('/api/performance/query', { query }),
-  getGoals: () => api.get('/api/performance/goals'),
-  createGoal: (data) => api.post('/api/performance/goal/create', data),
+  query: (query, employeeId) => api.post('/api/performance/query', { query, employee_id: employeeId }),
+  getGoals: (employeeId) => api.get(`/api/performance/goals?employee_id=${employeeId}`),
+  createGoal: (data, employeeId) => api.post('/api/performance/goal/create', { ...data, employee_id: employeeId }),
   updateGoal: (data) => api.put('/api/performance/goal/update', data),
-  getReviews: () => api.get('/api/performance/reviews'),
+  getReviews: (employeeId) => api.get(`/api/performance/reviews?employee_id=${employeeId}`),
 };
+
 
 export const leaveAPI = {
   query: (query) => api.post('/api/leave/query', { query }),

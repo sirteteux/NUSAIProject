@@ -11,6 +11,7 @@ const Performance = () => {
   const [goals, setGoals] = useState([]);
   const [reviews, setReviews] = useState([]);
   const [showNewGoal, setShowNewGoal] = useState(false);
+  const employeeId = user?.employee_id;
   const [newGoal, setNewGoal] = useState({
     title: '',
     description: '',
@@ -22,23 +23,24 @@ const Performance = () => {
     loadReviews();
   }, []);
 
+ 
   const loadGoals = async () => {
-    try {
-      const res = await performanceAPI.getGoals();
-      setGoals(res.data.goals || []);
-    } catch (error) {
-      console.error('Failed to load goals');
-    }
-  };
+  try {
+    const res = await performanceAPI.getGoals(employeeId);  
+    setGoals(res.data.goals || []);
+  } catch (error) {
+    console.error('Failed to load goals');
+  }
+};
 
-  const loadReviews = async () => {
-    try {
-      const res = await performanceAPI.getReviews();
-      setReviews(res.data.reviews || []);
-    } catch (error) {
-      console.error('Failed to load reviews');
-    }
-  };
+const loadReviews = async () => {
+  try {
+    const res = await performanceAPI.getReviews(employeeId);  
+    setReviews(res.data.reviews || []);
+  } catch (error) {
+    console.error('Failed to load reviews');
+  }
+};
 
   const handleQuerySubmit = async (e) => {
     e.preventDefault();
@@ -68,7 +70,8 @@ const Performance = () => {
   const handleCreateGoal = async (e) => {
     e.preventDefault();
     try {
-      await performanceAPI.createGoal(newGoal);
+      await performanceAPI.createGoal(newGoal, employeeId);
+      //await performanceAPI.createGoal(newGoal);
       toast.success('Goal created successfully!');
       setShowNewGoal(false);
       setNewGoal({ title: '', description: '', target_date: '' });

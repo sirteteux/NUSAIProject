@@ -48,7 +48,7 @@ export const coordinatorAPI = {
 export const payrollAPI = {
   query: (query) => api.post('/api/payroll/query', { query }),
   getPayslip: (employeeId) => api.get(`/api/payroll/payslip/${employeeId}`),
-  getHistory: () => api.get('/api/payroll/history'),
+  getHistory: (employeeId) => api.get(`/api/payroll/history/${employeeId}`),
 };
 
 export const recruitmentAPI = {

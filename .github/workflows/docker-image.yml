@@ -30,3 +30,17 @@ jobs:
         run: |
           docker compose build
           docker compose push
+
+      - name: Deploy to EC2 via SSH
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          script: |
+            cd /path/to/your/app/on/ec2 # Navigate to your application directory on the EC2 instance
+            # Pull the latest images and restart containers
+            docker compose pull
+            docker compose down
+            docker compose up -d --remove-orphans
+            # Replace 'docker compose' with 'docker-compose' if using older versions

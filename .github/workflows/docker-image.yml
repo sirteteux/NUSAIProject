@@ -39,6 +39,13 @@ jobs:
           key: ${{ secrets.SSH_PRIVATE_KEY }}
           source: "docker-compose.yml"
           target: "/home/ec2-user/"
+
+      - name: Deploy to EC2
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
           script: |
             cd /home/ec2-user # Navigate to your application directory on the EC2 instance
             # Pull the latest images and restart containers
@@ -46,3 +53,4 @@ jobs:
             docker compose down
             docker compose up -d --remove-orphans
             # Replace 'docker compose' with 'docker-compose' if using older versions
+

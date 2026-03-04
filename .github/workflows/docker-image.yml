@@ -9,16 +9,16 @@ jobs:
     runs-on: ubuntu-latest
     steps:
     - name: Checkout Repository
-      uses: [actions/checkout@v4](https://github.com)
+      uses: [actions/checkout@v4]
 
     - name: Log in to Docker Hub
-      uses: [docker/login-action@v3](https://github.com)
+      uses: [docker/login-action@v3]
       with:
         username: ${{ secrets.DOCKER_USERNAME }}
         password: ${{ secrets.DOCKERHUB_TOKEN }}
 
     - name: Build and push production image
-      uses: [docker/build-push-action@v6](https://github.com/docker/build-push-action)
+      uses: [docker/build-push-action@v6]
       with:
         context: .
         push: true

@@ -6,23 +6,27 @@ on:
   workflow_dispatch:
 
 jobs:
-  build:
+
+
+  build-push-prod-image:
     runs-on: ubuntu-latest
-
+    outputs:
+      sha_short: ${{ steps.vars.outputs.sha_short }}
     steps:
-    - name: Checkout Repository
-      uses: actions/checkout@v4
+      - name: Checkout code
+        uses: actions/checkout@v3
 
-    - name: Log in to Docker Hub
-      uses: docker/login-action@v3
-      with:
-        username: ${{ secrets.DOCKERHUB_USERNAME }}
-        password: ${{ secrets.DOCKERHUB_TOKEN }}
+      - name: Login to DockerHub
+        uses: docker/login-action@v2
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-    - name: Build and push Docker image
-      uses: docker/build-push-action@v6
-      with:
-        context: .
-        file: ./frontend/Dockerfile
-        push: true
-        tags: ${{ secrets.DOCKERHUB_USERNAME }}/your-image-name:latest
+      - name: Get short commit hash
+        id: vars
+        run: echo "sha_short=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
+
+      - name: Build and push with commit hash tag
+        run: |
+          docker compose build
+          docker push ${{ secrets.DOCKERHUB_USERNAME }}/nus_ai_proj:${{ steps.vars.outputs.sha_short }}

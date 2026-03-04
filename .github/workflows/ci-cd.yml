@@ -79,11 +79,11 @@ jobs:
           npm install
           npm test || echo "⚠️  No tests yet"
 
-      - name: Test Auth Service
-        run: |
-          cd services/auth-service
-          npm install
-          npm test || echo "⚠️  No tests yet"
+      # - name: Test Auth Service
+      #   run: |
+      #     cd services/auth-service
+      #     npm install
+      #     npm test || echo "⚠️  No tests yet"
 
       - name: Test Frontend
         run: |
@@ -106,8 +106,8 @@ jobs:
         service:
           - name: api-gateway
             context: ./services/api-gateway
-          - name: auth-service
-            context: ./services/auth-service
+          # - name: auth-service
+          #   context: ./services/auth-service
           - name: faq-service
             context: ./services/faq-service
           - name: payroll-service

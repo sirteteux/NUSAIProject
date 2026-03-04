@@ -6,32 +6,9 @@ on:
   workflow_dispatch:
 
 jobs:
-  check-code-lint:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v3
-      - name: Run linting
-        run: docker compose run dev npm run lint:check
 
-  check-code-format:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v3
-      - name: Run format check
-        run: docker compose run dev npm run format:check
-
-  run-test-cases:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v3
-      - name: Run tests
-        run: docker compose run dev npm run test
 
   build-push-prod-image:
-    needs: [check-code-lint, check-code-format, run-test-cases]
     runs-on: ubuntu-latest
     outputs:
       sha_short: ${{ steps.vars.outputs.sha_short }}

@@ -102,8 +102,8 @@ jobs:
         service:
           - name: api-gateway
             context: ./services/api-gateway
-          - name: auth-service
-            context: ./services/auth-service
+          # - name: auth-service
+          #   context: ./services/auth-service
           - name: faq-service
             context: ./services/faq-service
           - name: payroll-service

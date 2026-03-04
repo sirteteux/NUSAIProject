@@ -9,6 +9,7 @@ const Leave = () => {
   const [query, setQuery] = useState('');
   const [conversation, setConversation] = useState([]);
   const [loading, setLoading] = useState(false);
+  const employeeId = user?.employee_id;
   const [formData, setFormData] = useState({
     type: 'annual',
     start_date: '',
@@ -22,8 +23,7 @@ const Leave = () => {
 
   const loadBalance = async () => {
     try {
-      // Access the employee_id from your auth store's user object
-      const res = await leaveAPI.getBalance(user.employee_id); 
+      const res = await leaveAPI.getBalance(employeeId); 
       setBalance(res.data.balances);
     } catch (error) {
       toast.error('Failed to load balance');

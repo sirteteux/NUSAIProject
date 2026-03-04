@@ -22,7 +22,8 @@ const Leave = () => {
 
   const loadBalance = async () => {
     try {
-      const res = await leaveAPI.getBalance();
+      // Access the employee_id from your auth store's user object
+      const res = await leaveAPI.getBalance(user.employee_id); 
       setBalance(res.data.balances);
     } catch (error) {
       toast.error('Failed to load balance');

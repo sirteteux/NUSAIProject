@@ -68,7 +68,7 @@ export const performanceAPI = {
 export const leaveAPI = {
   query: (query) => api.post('/api/leave/query', { query }),
   request: (data) => api.post('/api/leave/request', data),
-  getBalance: () => api.get('/api/leave/balance'),
+  getBalance: (employee_id) => api.get(`/api/leave/balance?employee_id=${employee_id}`),
   getHistory: () => api.get('/api/leave/history'),
 };
 

@@ -1,0 +1,31 @@
+name: Docker Build & Push
+
+on:
+  push:
+    branches: ["main"]
+  workflow_dispatch:
+
+jobs:
+  docker-build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+
+      - name: Login to DockerHub
+        run: echo "${{ secrets.DOCKERHUB_TOKEN }}" | docker login -u "${{ secrets.DOCKERHUB_USERNAME }}" --password-stdin
+
+      - name: Get short commit SHA
+        id: vars
+        run: echo "sha_short=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
+
+      - name: Build Docker image
+        run: |
+          docker build -t ${{ secrets.DOCKERHUB_USERNAME }}/test:${{ steps.vars.outputs.sha_short }} .
+          docker tag ${{ secrets.DOCKERHUB_USERNAME }}/test:${{ steps.vars.outputs.sha_short }} ${{ secrets.DOCKERHUB_USERNAME }}/test:latest
+
+      - name: Push Docker images
+        run: |
+          docker push ${{ secrets.DOCKERHUB_USERNAME }}/test:${{ steps.vars.outputs.sha_short }}
+          docker push ${{ secrets.DOCKERHUB_USERNAME }}/test:latest

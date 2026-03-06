@@ -1,0 +1,49 @@
+name: Build and Publish image to Docker Hub
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main ]
+
+    paths:
+      - 'api/Dockerfile'
+      - 'front-end-nextjs/Dockerfile'
+
+jobs:
+  publish_images:
+    runs-on: ubuntu-latest
+
+    strategy:
+      matrix:
+        service:
+          - name: api-gateway
+            context: ./services/api-gateway
+          # - name: auth-service
+          #   context: ./services/auth-service
+          - name: faq-service
+            context: ./services/faq-service
+          - name: payroll-service
+            context: ./services/payroll-service
+          - name: leave-service
+            context: ./services/leave-service
+          - name: recruitment-service
+            context: ./services/recruitment-service
+          - name: performance-service
+            context: ./services/performance-service
+          - name: coordinator-service
+            context: ./services/coordinator-service
+          - name: frontend
+            context: ./frontend
+
+    steps:
+      - name: checkout
+        uses: actions/checkout@v4
+      - name: build image
+        run: |
+          docker build ./api/ -t andreaslaukt/test:latest
+          docker build ./front-end-nextjs/ -t andreaslaukt/test:latest
+      - name: push image to docker hub
+        run: |
+          docker login -u andreaslaukt -p ${{ secrets.DOCKER_HUB_TOKEN }}
+          docker push andreaslaukt/test:latest
+          docker push andreaslaukt/test:latest

@@ -17,6 +17,8 @@ const Performance = () => {
     description: '',
     target_date: ''
   });
+  const [conversationId] = useState(() => crypto.randomUUID());
+  
 
   useEffect(() => {
     loadGoals();
@@ -50,8 +52,12 @@ const loadReviews = async () => {
     setLoading(true);
 
     try {
-      const response = await performanceAPI.query(query);
-      
+      //const response = await performanceAPI.query(query);
+      const response = await performanceAPI.query({
+          query: query,
+          conversation_id: conversationId
+      });
+          
       setConversation(prev => [...prev, { 
         type: 'ai', 
         text: response.data.answer

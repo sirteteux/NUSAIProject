@@ -9,7 +9,7 @@ const AskAnything = () => {
   const [query, setQuery] = useState('');
   const [conversation, setConversation] = useState([]);
   const [loading, setLoading] = useState(false);
-  const [agents, setAgents] = useState([]);
+  const [agents, setAgents] = useState([]);  
 
   useEffect(() => {
     loadAgents();

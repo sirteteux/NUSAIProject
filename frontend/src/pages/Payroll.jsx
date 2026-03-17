@@ -11,6 +11,8 @@ const Payroll = () => {
   const [loading, setLoading] = useState(false);
   const [history, setHistory] = useState([]);
   const employeeId = user?.employee_id;
+  const [conversationId] = useState(() => crypto.randomUUID());
+  
 
   useEffect(() => {
     loadHistory();
@@ -33,7 +35,11 @@ const Payroll = () => {
     setLoading(true);
 
     try {
-      const response = await payrollAPI.query(query);
+      //const response = await payrollAPI.query(query);
+      const response = await payrollAPI.query({
+          query: query,
+          conversation_id: conversationId
+      });
       
       setConversation(prev => [...prev, { 
         type: 'ai', 

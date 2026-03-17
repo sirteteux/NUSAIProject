@@ -9,6 +9,7 @@ const Recruitment = () => {
   const [loading, setLoading] = useState(false);
   const [openings, setOpenings] = useState([]);
   const [selectedJob, setSelectedJob] = useState(null);
+  const [conversationId] = useState(() => crypto.randomUUID());
 
   useEffect(() => {
     loadOpenings();
@@ -31,8 +32,10 @@ const Recruitment = () => {
     setLoading(true);
 
     try {
-      const response = await recruitmentAPI.query(query);
-      
+      const response = await recruitmentAPI.query({
+          query: query,
+          conversation_id: conversationId
+      });
       setConversation(prev => [...prev, { 
         type: 'ai', 
         text: response.data.answer

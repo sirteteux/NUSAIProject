@@ -12,8 +12,10 @@ from dotenv import load_dotenv
 import logging
 from openai import OpenAI
 from datetime import datetime
-import json
 import uvicorn
+import uuid
+from motor.motor_asyncio import AsyncIOMotorClient
+from bson import ObjectId
 
 load_dotenv()
 
@@ -37,27 +39,95 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# ─────────────────────────────────────────────
+# OpenAI Setup
+# ─────────────────────────────────────────────
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 if not OPENAI_API_KEY:
     logger.error("❌ OPENAI_API_KEY not found!")
 else:
-    logger.info(f"✅ OpenAI API Key configured")
+    logger.info("✅ OpenAI API Key configured")
 
 client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 
-# Models
+# ─────────────────────────────────────────────
+# MongoDB Setup
+# ─────────────────────────────────────────────
+MONGODB_URL = os.getenv("DATABASE_URL", "mongodb://localhost:27017")
+DB_NAME = os.getenv("DB_NAME", "recruitment_db")
+
+mongo_client: AsyncIOMotorClient = None
+db = None
+
+# ─────────────────────────────────────────────
+# Pydantic Models
+# ─────────────────────────────────────────────
 class RecruitmentQueryRequest(BaseModel):
     query: str
     context: Optional[str] = None
+    conversation_id: Optional[str] = None      # ← thread identifier
 
 class RecruitmentQueryResponse(BaseModel):
     answer: str
     data: Optional[Dict] = None
+    conversation_id: str                        # ← returned so frontend can reuse it
 
-# Job openings database
-JOB_OPENINGS = [
+class JobOpening(BaseModel):
+    title: str
+    department: str
+    location: str
+    type: str
+    experience: str
+    skills: List[str]
+    description: str
+    salary_range: str
+    status: str = "open"
+    posted: str = datetime.now().strftime("%Y-%m-%d")
+
+# ─────────────────────────────────────────────
+# Helpers
+# ─────────────────────────────────────────────
+def serialize_doc(doc: dict) -> dict:
+    if doc and "_id" in doc:
+        doc["id"] = str(doc["_id"])
+        del doc["_id"]
+    return doc
+
+async def log_message(conv_id: str, role: str, message: str, user_id: str = None):
+    """Persist a single chat message. Never raises — logging must not break the main flow."""
+    if db is None:
+        return
+    try:
+        await db.chat_history.insert_one({
+            "conversation_id": conv_id,
+            "service": "recruitment",
+            "user_id": user_id,
+            "role": role,
+            "message": message,
+            "timestamp": datetime.now().isoformat()
+        })
+    except Exception as e:
+        logger.warning(f"⚠️ Failed to log message: {str(e)}")
+
+async def get_conversation_history(conv_id: str, limit: int = 10) -> List[Dict]:
+    """Fetch the last N messages for a conversation, oldest-first for correct context order."""
+    if db is None:
+        return []
+    try:
+        cursor = db.chat_history.find(
+            {"conversation_id": conv_id},
+            sort=[("timestamp", 1)]
+        ).limit(limit)
+        return await cursor.to_list(length=limit)
+    except Exception as e:
+        logger.warning(f"⚠️ Failed to fetch history: {str(e)}")
+        return []
+
+# ─────────────────────────────────────────────
+# Seed Data
+# ─────────────────────────────────────────────
+SEED_JOB_OPENINGS = [
     {
-        "id": 1,
         "title": "Senior Software Engineer",
         "department": "Engineering",
         "location": "Singapore",
@@ -70,7 +140,6 @@ JOB_OPENINGS = [
         "salary_range": "SGD 8,000 - 12,000"
     },
     {
-        "id": 2,
         "title": "HR Manager",
         "department": "Human Resources",
         "location": "Singapore",
@@ -83,7 +152,6 @@ JOB_OPENINGS = [
         "salary_range": "SGD 6,000 - 8,000"
     },
     {
-        "id": 3,
         "title": "Marketing Specialist",
         "department": "Marketing",
         "location": "Remote",
@@ -96,7 +164,6 @@ JOB_OPENINGS = [
         "salary_range": "SGD 4,500 - 6,500"
     },
     {
-        "id": 4,
         "title": "Data Scientist",
         "department": "Analytics",
         "location": "Singapore",
@@ -126,100 +193,234 @@ Company Recruitment Policies:
 
 Be professional, data-driven, and fair in all assessments."""
 
+# ─────────────────────────────────────────────
+# Startup / Shutdown
+# ─────────────────────────────────────────────
+@app.on_event("startup")
+async def startup_event():
+    global mongo_client, db
+
+    logger.info("=" * 50)
+    logger.info("🚀 Recruitment Agent Starting Up")
+    logger.info("=" * 50)
+    logger.info(f"OpenAI API:  {'✅ Configured' if OPENAI_API_KEY else '❌ Missing'}")
+    logger.info(f"MongoDB URL: {MONGODB_URL}")
+
+    try:
+        mongo_client = AsyncIOMotorClient(MONGODB_URL)
+        db = mongo_client[DB_NAME]
+        await mongo_client.admin.command("ping")
+        logger.info("✅ MongoDB connected successfully")
+
+        if await db.job_openings.count_documents({}) == 0:
+            await db.job_openings.insert_many(SEED_JOB_OPENINGS)
+            logger.info(f"🌱 Seeded {len(SEED_JOB_OPENINGS)} job openings")
+        else:
+            count = await db.job_openings.count_documents({})
+            logger.info(f"📋 Found {count} existing job openings in MongoDB")
+
+    except Exception as e:
+        logger.error(f"❌ MongoDB connection failed: {str(e)}")
+
+    logger.info("=" * 50)
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    if mongo_client:
+        mongo_client.close()
+        logger.info("🔌 MongoDB connection closed")
+
+# ─────────────────────────────────────────────
+# Health Check
+# ─────────────────────────────────────────────
 @app.get("/health")
 async def health_check():
+    mongo_status = "disconnected"
+    try:
+        if mongo_client:
+            await mongo_client.admin.command("ping")
+            mongo_status = "connected"
+    except Exception:
+        mongo_status = "error"
+
     return {
         "status": "healthy",
         "service": "recruitment-agent",
         "version": "1.0.0",
-        "openai_status": "configured" if OPENAI_API_KEY else "missing"
+        "openai_status": "configured" if OPENAI_API_KEY else "missing",
+        "mongodb_status": mongo_status
     }
 
+# ─────────────────────────────────────────────
+# AI Query — Level 1 Conversational Memory
+# ─────────────────────────────────────────────
 @app.post("/api/recruitment/query", response_model=RecruitmentQueryResponse)
 async def query_recruitment(request: RecruitmentQueryRequest):
     try:
         logger.info(f"📥 Recruitment query: {request.query}")
-        
+
         if not client:
             raise HTTPException(status_code=500, detail="OpenAI not configured")
-        
-        # Add context about current openings
-        openings_context = f"\nCurrent Open Positions ({len(JOB_OPENINGS)}):\n"
-        for job in JOB_OPENINGS[:3]:
-            openings_context += f"- {job['title']} ({job['department']}) - {job['location']}\n"
-        
+        if db is None:
+            raise HTTPException(status_code=500, detail="Database not connected")
+
+        # Use provided conversation_id or generate a new one
+        conv_id = request.conversation_id or str(uuid.uuid4())
+
+        # ── Fetch live job openings from MongoDB ──
+        cursor = db.job_openings.find({"status": "open"})
+        open_jobs = await cursor.to_list(length=100)
+
+        openings_context = f"\nCurrent Open Positions ({len(open_jobs)}):\n"
+        for job in open_jobs[:5]:
+            openings_context += (
+                f"- {job['title']} ({job['department']}) | "
+                f"{job['location']} | {job['salary_range']}\n"
+            )
+
+        # ── Start messages with system prompt ──
         messages = [
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "system", "content": openings_context},
         ]
-        
+
         if request.context:
             messages.append({"role": "system", "content": f"Additional context: {request.context}"})
-        
+
+        # ── Inject conversation history for Level 1 memory ──
+        history = await get_conversation_history(conv_id, limit=10)
+        for msg in history:
+            messages.append({"role": msg["role"], "content": msg["message"]})
+
+        logger.info(f"💬 Injecting {len(history)} previous messages into context")
+
+        # ── Append current user message ──
         messages.append({"role": "user", "content": request.query})
-        
+
+        # ── Call OpenAI ──
         response = client.chat.completions.create(
             model="gpt-4o-mini",
             messages=messages,
             temperature=0.3,
             max_tokens=500
         )
-        
+
         answer = response.choices[0].message.content.strip()
-        
-        logger.info(f"✅ Generated recruitment response")
-        
+        logger.info("✅ Generated recruitment response")
+
+        # ── Persist both sides of the exchange ──
+        await log_message(conv_id, "user",      request.query, None)
+        await log_message(conv_id, "assistant", answer,        None)
+
         return RecruitmentQueryResponse(
             answer=answer,
-            data={"open_positions": len(JOB_OPENINGS)}
+            data={"open_positions": len(open_jobs)},
+            conversation_id=conv_id
         )
-        
+
+    except HTTPException:
+        raise
     except Exception as e:
-        logger.error(f"❌ Error: {str(e)}")
+        logger.error(f"❌ Error in query_recruitment: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
+# ─────────────────────────────────────────────
+# Job Openings Endpoints
+# ─────────────────────────────────────────────
 @app.get("/api/recruitment/openings")
 async def get_openings(department: Optional[str] = None, location: Optional[str] = None):
     try:
-        openings = JOB_OPENINGS.copy()
-        
+        if db is None:
+            raise HTTPException(status_code=500, detail="Database not connected")
+
+        query_filter: Dict = {}
         if department:
-            openings = [j for j in openings if j["department"].lower() == department.lower()]
-        
+            query_filter["department"] = {"$regex": f"^{department}$", "$options": "i"}
         if location:
-            openings = [j for j in openings if location.lower() in j["location"].lower()]
-        
-        return {
-            "openings": openings,
-            "total": len(openings)
-        }
-        
+            query_filter["location"] = {"$regex": location, "$options": "i"}
+
+        cursor = db.job_openings.find(query_filter)
+        openings = await cursor.to_list(length=100)
+        openings = [serialize_doc(job) for job in openings]
+
+        return {"openings": openings, "total": len(openings)}
+
+    except HTTPException:
+        raise
     except Exception as e:
+        logger.error(f"❌ Error in get_openings: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/recruitment/opening/{job_id}")
-async def get_opening(job_id: int):
+async def get_opening(job_id: str):
     try:
-        job = next((j for j in JOB_OPENINGS if j["id"] == job_id), None)
-        
+        if db is None:
+            raise HTTPException(status_code=500, detail="Database not connected")
+
+        try:
+            oid = ObjectId(job_id)
+        except Exception:
+            raise HTTPException(status_code=400, detail="Invalid job ID format")
+
+        job = await db.job_openings.find_one({"_id": oid})
         if not job:
             raise HTTPException(status_code=404, detail="Job not found")
-        
-        return job
-        
-    except HTTPException as he:
-        raise he
+
+        return serialize_doc(job)
+
+    except HTTPException:
+        raise
     except Exception as e:
+        logger.error(f"❌ Error in get_opening: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.on_event("startup")
-async def startup_event():
-    logger.info("=" * 50)
-    logger.info("🚀 Recruitment Agent Starting Up")
-    logger.info("=" * 50)
-    logger.info(f"OpenAI API: {'✅ Configured' if OPENAI_API_KEY else '❌ Missing'}")
-    logger.info(f"Job Openings: {len(JOB_OPENINGS)}")
-    logger.info("=" * 50)
+@app.post("/api/recruitment/openings")
+async def create_opening(job: JobOpening):
+    try:
+        if db is None:
+            raise HTTPException(status_code=500, detail="Database not connected")
+
+        result = await db.job_openings.insert_one(job.dict())
+        logger.info(f"✅ Created new job opening: {job.title}")
+        return {"id": str(result.inserted_id), "message": "Job opening created successfully"}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"❌ Error in create_opening: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+# ─────────────────────────────────────────────
+# Chat History Endpoints
+# ─────────────────────────────────────────────
+@app.get("/api/recruitment/history/chat")
+async def get_chat_history(limit: int = 50):
+    """All recent recruitment chat messages."""
+    if db is None:
+        raise HTTPException(status_code=500, detail="Database not connected")
+
+    cursor = db.chat_history.find(
+        {"service": "recruitment"},
+        sort=[("timestamp", -1)]
+    ).limit(limit)
+
+    history = await cursor.to_list(length=limit)
+    return {"history": [serialize_doc(h) for h in history]}
+
+@app.get("/api/recruitment/history/chat/{conversation_id}")
+async def get_conversation(conversation_id: str):
+    """All messages in a specific conversation thread, in chronological order."""
+    if db is None:
+        raise HTTPException(status_code=500, detail="Database not connected")
+
+    cursor = db.chat_history.find(
+        {"conversation_id": conversation_id},
+        sort=[("timestamp", 1)]
+    )
+
+    messages = await cursor.to_list(length=200)
+    return {"conversation_id": conversation_id, "messages": [serialize_doc(m) for m in messages]}
+
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 8005))

@@ -8,6 +8,8 @@ const FAQ = () => {
   const [loading, setLoading] = useState(false);
   const [conversation, setConversation] = useState([]);
   const [popularQuestions, setPopularQuestions] = useState([]);
+  const [conversationId] = useState(() => crypto.randomUUID());
+  
 
   useEffect(() => {
     loadPopularQuestions();
@@ -31,8 +33,12 @@ const FAQ = () => {
     setLoading(true);
 
     try {
-      const response = await faqAPI.ask(question);
-      
+      //const response = await faqAPI.ask(question);
+      const response = await recruitmentAPI.query({
+          question: question,
+          conversation_id: conversationId
+      });
+
       // Add AI response to conversation
       setConversation(prev => [...prev, { 
         type: 'ai', 

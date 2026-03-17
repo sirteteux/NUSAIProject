@@ -16,6 +16,7 @@ const Leave = () => {
     end_date: '',
     reason: ''
   });
+  const [conversationId] = useState(() => crypto.randomUUID());
 
   useEffect(() => {
     loadBalance();
@@ -38,7 +39,11 @@ const Leave = () => {
     setLoading(true);
 
     try {
-      const response = await leaveAPI.query(query);
+      // const response = await leaveAPI.query(query);
+      const response = await leaveAPI.query({
+          query: query,
+          conversation_id: conversationId
+      });
       
       setConversation(prev => [...prev, { 
         type: 'ai', 

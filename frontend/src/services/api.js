@@ -35,7 +35,7 @@ export const authAPI = {
 };
 
 export const faqAPI = {
-  ask: (question) => api.post('/api/faq/ask', { question }),
+  ask: (question) => api.post('/api/faq/ask', question),
   getPopular: () => api.get('/api/faq/popular'),
   getCategories: () => api.get('/api/faq/categories'),
 };
@@ -46,20 +46,23 @@ export const coordinatorAPI = {
 };
 
 export const payrollAPI = {
-  query: (query) => api.post('/api/payroll/query', { query }),
+  //query: (query) => api.post('/api/payroll/query', { query }),
+  query: (data) => api.post('/api/payroll/query', data ),
   getPayslip: (employeeId) => api.get(`/api/payroll/payslip/${employeeId}`),
   getHistory: (employeeId) => api.get(`/api/payroll/history/${employeeId}`),
 };
 
 export const recruitmentAPI = {
-  query: (query, context) => api.post('/api/recruitment/query', { query, context }),
+  //query: (query, context) => api.post('/api/recruitment/query', { query, context }),
+  query: (data) => api.post('/api/recruitment/query', data),
   getOpenings: (params) => api.get('/api/recruitment/openings', { params }),
   getOpening: (id) => api.get(`/api/recruitment/opening/${id}`),
 };
 
 
 export const performanceAPI = {
-  query: (query, employeeId) => api.post('/api/performance/query', { query, employee_id: employeeId }),
+  //query: (query, employeeId) => api.post('/api/performance/query', { query, employee_id: employeeId }),
+  query: (data) => api.post('/api/performance/query', data),
   getGoals: (employeeId) => api.get(`/api/performance/goals?employee_id=${employeeId}`),
   createGoal: (data, employeeId) => api.post('/api/performance/goal/create', { ...data, employee_id: employeeId }),
   updateGoal: (data) => api.put('/api/performance/goal/update', data),
@@ -68,7 +71,8 @@ export const performanceAPI = {
 
 
 export const leaveAPI = {
-  query: (query) => api.post('/api/leave/query', { query }),
+  //query: (query) => api.post('/api/leave/query', { query }),
+  query: (data) => api.post('/api/leave/query', data),
   request: (data) => api.post('/api/leave/request', data),
   getBalance: (employeeId) => api.get(`/api/leave/balance?employee_id=${employeeId}`),
   getHistory: () => api.get('/api/leave/history'),

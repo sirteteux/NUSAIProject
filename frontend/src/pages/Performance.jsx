@@ -55,7 +55,8 @@ const loadReviews = async () => {
       //const response = await performanceAPI.query(query);
       const response = await performanceAPI.query({
           query: query,
-          conversation_id: conversationId
+          conversation_id: conversationId,
+          employee_id: employeeId
       });
           
       setConversation(prev => [...prev, { 

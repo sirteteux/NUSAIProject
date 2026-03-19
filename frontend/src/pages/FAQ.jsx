@@ -34,7 +34,7 @@ const FAQ = () => {
 
     try {
       //const response = await faqAPI.ask(question);
-      const response = await recruitmentAPI.query({
+      const response = await faqAPI.ask({
           question: question,
           conversation_id: conversationId
       });

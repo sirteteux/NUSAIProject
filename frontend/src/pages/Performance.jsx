@@ -3,6 +3,18 @@ import { toast } from 'react-toastify';
 import { performanceAPI } from '../services/api';
 import { useAuthStore } from '../stores/authStore';
 
+const getSafeUUID = () => {
+/*   if (typeof window !== 'undefined' && window.crypto && window.crypto.randomUUID) {
+    return window.crypto.randomUUID();
+  } */
+  // Fallback for insecure EC2 (HTTP) contexts
+  return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, (c) => {
+    const r = (Math.random() * 16) | 0;
+    const v = c === 'x' ? r : (r & 0x3) | 0x8;
+    return v.toString(16);
+  });
+};
+
 const Performance = () => {
   const { user } = useAuthStore();
   const [query, setQuery] = useState('');
@@ -17,8 +29,8 @@ const Performance = () => {
     description: '',
     target_date: ''
   });
-  const [conversationId] = useState(() => crypto.randomUUID());
-  
+  //const [conversationId] = useState(() => crypto.randomUUID());
+  const [conversationId] = useState(() => getSafeUUID());    
 
   useEffect(() => {
     loadGoals();

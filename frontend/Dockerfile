@@ -12,7 +12,7 @@ RUN npm ci
 COPY . .
 
 # Build-time argument for API Gateway URL
-ARG VITE_API_GATEWAY_URL=http://3.1.50.134:8000
+ARG VITE_API_GATEWAY_URL=http://54.169.118.42:8000
 ENV VITE_API_GATEWAY_URL=$VITE_API_GATEWAY_URL
 
 # Build the application

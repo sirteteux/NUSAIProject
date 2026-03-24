@@ -322,11 +322,19 @@ async def query_payroll(request: PayrollQueryRequest):
         # Use provided conversation_id or generate a new one
         conv_id = request.conversation_id or str(uuid.uuid4())
 
-        # ── Guardrail: sensitive keyword intercept ──
-        # Checked BEFORE hitting OpenAI — saves tokens and enforces policy instantly
-        query_lower = request.query.lower()
+        # ── Strip coordinator context before guardrail check ──────────────────
+        # The coordinator appends [Prior conversation context: ...] to queries.
+        # That block may contain sensitive words from earlier turns that would
+        # incorrectly trigger the guardrail on an innocent follow-up question.
+        CONTEXT_MARKER = "[Prior conversation context:"
+        original_query = request.query
+        if CONTEXT_MARKER in request.query:
+            original_query = request.query.split(CONTEXT_MARKER)[0].strip()
+
+        # ── Guardrail: sensitive keyword intercept (original query only) ──────
+        query_lower = original_query.lower()
         if any(kw in query_lower for kw in PAYROLL_SENSITIVE_KEYWORDS):
-            logger.warning(f"🚨 Sensitive payroll query intercepted: {request.query}")
+            logger.warning(f"🚨 Sensitive payroll query intercepted: {original_query}")
             await log_message(conv_id, "user",      request.query,              request.employee_id, flagged=True)
             await log_message(conv_id, "assistant", PAYROLL_ESCALATION_RESPONSE, request.employee_id, flagged=True)
             return PayrollQueryResponse(

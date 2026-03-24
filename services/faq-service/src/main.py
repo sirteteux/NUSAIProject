@@ -259,9 +259,20 @@ async def ask_question(request: QuestionRequest):
         # Use provided conversation_id or generate a new one
         conv_id = request.conversation_id or str(uuid.uuid4())
 
-        # ── Sensitive keyword check — short-circuit before hitting OpenAI ──
-        if any(kw in request.question.lower() for kw in SENSITIVE_KEYWORDS):
-            logger.warning(f"Sensitive query detected: {request.question}")
+        # ── Strip coordinator-appended context before guardrail check ─────────
+        # The coordinator enriches queries with prior conversation history by
+        # appending a [Prior conversation context: ...] block. That block may
+        # contain sensitive words (e.g. "salary" from a previous payroll turn)
+        # that would incorrectly trigger the guardrail on an innocent question.
+        # We extract only the original user question — the text before the marker.
+        CONTEXT_MARKER = "[Prior conversation context:"
+        original_question = request.question
+        if CONTEXT_MARKER in request.question:
+            original_question = request.question.split(CONTEXT_MARKER)[0].strip()
+
+        # ── Sensitive keyword check — only on the original question ──────────
+        if any(kw in original_question.lower() for kw in SENSITIVE_KEYWORDS):
+            logger.warning(f"Sensitive query detected: {original_question}")
             sensitive_answer = (
                 "This seems like a sensitive matter that requires direct HR support. "
                 "Please contact hr@company.com or call +65 6123 4567."

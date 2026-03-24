@@ -41,8 +41,12 @@ export const faqAPI = {
 };
 
 export const coordinatorAPI = {
-  ask: (query, context) => api.post('/api/coordinator/ask', { query, context }),
+  //ask: (query, context) => api.post('/api/coordinator/ask', { query, context }),
+  ask: (data) => api.post('/api/coordinator/ask', data),
   getAgents: () => api.get('/api/coordinator/agents'),
+  getChatHistory: (employeeId) => api.get('/api/coordinator/history/chat', { params: { employee_id: employeeId } }),
+  getConversation: (conversationId) => api.get(`/api/coordinator/history/chat/${conversationId}`),
+  getSession: (employeeId) => api.get(`/api/coordinator/session/${employeeId}`),
 };
 
 export const payrollAPI = {

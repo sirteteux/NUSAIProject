@@ -10,6 +10,8 @@ const AskAnything = () => {
   const [conversation, setConversation] = useState([]);
   const [loading, setLoading] = useState(false);
   const [agents, setAgents] = useState([]);  
+  const [conversationId, setConversationId] = useState(null);
+  const employeeId = user?.employee_id;
 
   useEffect(() => {
     loadAgents();
@@ -32,8 +34,15 @@ const AskAnything = () => {
     setLoading(true);
 
     try {
-      const response = await coordinatorAPI.ask(query);
+      //const response = await coordinatorAPI.ask(query);
+      const response = await coordinatorAPI.ask({
+        query,
+        employee_id: employeeId,
+        conversation_id: conversationId,
+      });
       
+      setConversationId(response.data.conversation_id);
+
       setConversation(prev => [...prev, { 
         type: 'ai', 
         text: response.data.answer,
@@ -43,6 +52,7 @@ const AskAnything = () => {
       setQuery('');
       toast.success(`Routed to ${response.data.agent_used} Agent!`);
     } catch (error) {
+      console.error('Coordinator error:', error.response?.data); 
       toast.error('Failed to get answer');
       setConversation(prev => prev.slice(0, -1));
     } finally {

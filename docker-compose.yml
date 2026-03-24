@@ -183,6 +183,8 @@ services:
       - PORT=8007
       - OPENAI_API_KEY=${OPENAI_API_KEY}
       - REDIS_URL=redis://redis:6379
+      - DATABASE_URL=${MONGODB_URI}
+      - DB_NAME=coordinator_db  
       - FAQ_SERVICE_URL=http://faq-service:8002
       - PAYROLL_SERVICE_URL=http://payroll-service:8003
       - LEAVE_SERVICE_URL=http://leave-service:8004

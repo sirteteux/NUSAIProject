@@ -303,10 +303,16 @@ async def query_recruitment(request: RecruitmentQueryRequest):
         # Use provided conversation_id or generate a new one
         conv_id = request.conversation_id or str(uuid.uuid4())
 
-        # ── Guardrail: sensitive keyword intercept ──
-        query_lower = request.query.lower()
+        # ── Strip coordinator context before guardrail check ──────────────────
+        CONTEXT_MARKER = "[Prior conversation context:"
+        original_query = request.query
+        if CONTEXT_MARKER in request.query:
+            original_query = request.query.split(CONTEXT_MARKER)[0].strip()
+
+        # ── Guardrail: sensitive keyword intercept (original query only) ──────
+        query_lower = original_query.lower()
         if any(kw in query_lower for kw in RECRUITMENT_SENSITIVE_KEYWORDS):
-            logger.warning(f"🚨 Sensitive recruitment query intercepted: {request.query}")
+            logger.warning(f"🚨 Sensitive recruitment query intercepted: {original_query}")
             await log_message(conv_id, "user",      request.query,                    None, flagged=True)
             await log_message(conv_id, "assistant", RECRUITMENT_ESCALATION_RESPONSE,  None, flagged=True)
             return RecruitmentQueryResponse(

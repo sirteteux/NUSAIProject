@@ -93,7 +93,8 @@ def serialize_doc(doc: dict) -> dict:
         del doc["_id"]
     return doc
 
-async def log_message(conv_id: str, role: str, message: str, employee_id: str = None):
+async def log_message(conv_id: str, role: str, message: str, employee_id: str = None,
+                      flagged: bool = False):
     """Persist a single chat message. Never raises — logging must not break the main flow."""
     if db is None:
         return
@@ -104,6 +105,7 @@ async def log_message(conv_id: str, role: str, message: str, employee_id: str = 
             "employee_id": employee_id,
             "role": role,
             "message": message,
+            "flagged": flagged,
             "timestamp": datetime.now().isoformat()
         })
     except Exception as e:
@@ -186,7 +188,41 @@ Company Performance Framework:
 - Development: 10% time for learning
 - Feedback Culture: Continuous feedback encouraged
 
-Be constructive, data-driven, and growth-focused in all assessments."""
+Be constructive, data-driven, and growth-focused in all assessments.
+
+GUARDRAILS — NEVER DO THESE:
+DO NOT disclose another employee's performance rating, goals, or review details
+DO NOT confirm or deny promotion or termination decisions
+DO NOT provide legal advice on unfair dismissal or employment disputes
+DO NOT manipulate or fabricate performance ratings or review scores
+DO NOT handle harassment or discrimination complaints — escalate to HR
+"""
+
+# Queries matching these keywords are short-circuited before hitting OpenAI.
+# They are logged with flagged=True for HR audit and return a static escalation response.
+PERFORMANCE_SENSITIVE_KEYWORDS = [
+    "other employee",        # attempting to access another person's data
+    "everyone's rating",     # bulk performance data disclosure
+    "rating of",             # fishing for another person's score
+    "fire",                  # termination discussion
+    "terminate",             # termination discussion
+    "dismiss",               # unfair dismissal queries
+    "promote me",            # demanding a promotion decision
+    "force promotion",       # attempting to bypass process
+    "change my rating",      # attempting to manipulate review scores
+    "increase my score",     # attempting to manipulate KPI data
+    "harassment",            # workplace complaint — escalate to HR
+    "discrimination",        # legal complaint — escalate to HR
+    "lawsuit",               # legal dispute
+    "override",              # prompt injection attempt
+    "ignore instructions",   # jailbreak attempt
+]
+
+PERFORMANCE_ESCALATION_RESPONSE = (
+    "This query involves a sensitive performance matter that requires direct HR support. "
+    "For promotion decisions, termination concerns, or workplace disputes, please contact "
+    "hr@company.com or call +65 6123 4567 to speak with an HR representative."
+)
 
 # ─────────────────────────────────────────────
 # Startup / Shutdown
@@ -262,6 +298,18 @@ async def query_performance(request: PerformanceQueryRequest):
 
         # Use provided conversation_id or generate a new one
         conv_id = request.conversation_id or str(uuid.uuid4())
+
+        # ── Guardrail: sensitive keyword intercept ──
+        query_lower = request.query.lower()
+        if any(kw in query_lower for kw in PERFORMANCE_SENSITIVE_KEYWORDS):
+            logger.warning(f"🚨 Sensitive performance query intercepted: {request.query}")
+            await log_message(conv_id, "user",      request.query,                   request.employee_id, flagged=True)
+            await log_message(conv_id, "assistant", PERFORMANCE_ESCALATION_RESPONSE, request.employee_id, flagged=True)
+            return PerformanceQueryResponse(
+                answer=PERFORMANCE_ESCALATION_RESPONSE,
+                data=None,
+                conversation_id=conv_id
+            )
 
         # ── Build employee performance context from DB ──
         employee_context = ""

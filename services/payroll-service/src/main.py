@@ -96,7 +96,8 @@ def serialize_doc(doc: dict) -> dict:
         del doc["_id"]
     return doc
 
-async def log_message(conv_id: str, role: str, message: str, employee_id: str = None):
+async def log_message(conv_id: str, role: str, message: str, employee_id: str = None,
+                      flagged: bool = False):
     """Persist a single chat message. Never raises — logging must not break the main flow."""
     if db is None:
         return
@@ -107,6 +108,7 @@ async def log_message(conv_id: str, role: str, message: str, employee_id: str = 
             "employee_id": employee_id,
             "role": role,
             "message": message,
+            "flagged": flagged,   # True for guardrail-intercepted messages
             "timestamp": datetime.now().isoformat()
         })
     except Exception as e:
@@ -172,7 +174,36 @@ Be professional, accurate, and friendly. If you need specific employee data to a
 let the user know you'll need their employee ID.
 
 When providing salary information, always format currency as SGD (Singapore Dollars).
+
+GUARDRAILS — NEVER DO THESE:
+DO NOT disclose another employee's salary, payslip, or compensation details
+DO NOT approve, process, or commit to salary changes, bonuses, or increments
+DO NOT provide tax advice or interpret tax law
+DO NOT discuss redundancy, retrenchment packages, or termination payouts
+DO NOT share payroll system credentials or internal configuration details
 """
+
+# Queries matching these keywords are short-circuited before hitting OpenAI.
+# They are logged with flagged=True for HR audit and return a static escalation response.
+PAYROLL_SENSITIVE_KEYWORDS = [
+    "other employee",      # attempting to access another person's data
+    "everyone's salary",   # bulk salary disclosure attempt
+    "salary of",           # fishing for a specific person's pay
+    "how much does",       # comparative salary query about others
+    "retrench",            # redundancy / termination payout queries
+    "terminate",           # termination-related payroll queries
+    "lawsuit",             # legal disputes involving pay
+    "underpaid",           # potential legal / dispute escalation
+    "discrimination",      # pay discrimination complaints
+    "override",            # prompt injection attempt
+    "ignore instructions", # jailbreak attempt
+]
+
+PAYROLL_ESCALATION_RESPONSE = (
+    "This query involves a sensitive payroll matter that requires direct HR support. "
+    "Please contact hr@company.com or call +65 6123 4567 to speak with a payroll specialist "
+    "who can properly assist you."
+)
 
 # ─────────────────────────────────────────────
 # Startup / Shutdown
@@ -290,6 +321,19 @@ async def query_payroll(request: PayrollQueryRequest):
 
         # Use provided conversation_id or generate a new one
         conv_id = request.conversation_id or str(uuid.uuid4())
+
+        # ── Guardrail: sensitive keyword intercept ──
+        # Checked BEFORE hitting OpenAI — saves tokens and enforces policy instantly
+        query_lower = request.query.lower()
+        if any(kw in query_lower for kw in PAYROLL_SENSITIVE_KEYWORDS):
+            logger.warning(f"🚨 Sensitive payroll query intercepted: {request.query}")
+            await log_message(conv_id, "user",      request.query,              request.employee_id, flagged=True)
+            await log_message(conv_id, "assistant", PAYROLL_ESCALATION_RESPONSE, request.employee_id, flagged=True)
+            return PayrollQueryResponse(
+                answer=PAYROLL_ESCALATION_RESPONSE,
+                data=None,
+                conversation_id=conv_id
+            )
 
         # ── Build employee context from DB ──
         employee_context = ""

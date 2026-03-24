@@ -93,7 +93,8 @@ def serialize_doc(doc: dict) -> dict:
         del doc["_id"]
     return doc
 
-async def log_message(conv_id: str, role: str, message: str, user_id: str = None):
+async def log_message(conv_id: str, role: str, message: str, user_id: str = None,
+                      flagged: bool = False):
     """Persist a single chat message. Never raises — logging must not break the main flow."""
     if db is None:
         return
@@ -104,6 +105,7 @@ async def log_message(conv_id: str, role: str, message: str, user_id: str = None
             "user_id": user_id,
             "role": role,
             "message": message,
+            "flagged": flagged,
             "timestamp": datetime.now().isoformat()
         })
     except Exception as e:
@@ -191,7 +193,41 @@ Company Recruitment Policies:
 - Standard notice period: 1 month
 - Probation period: 3 months
 
-Be professional, data-driven, and fair in all assessments."""
+Be professional, data-driven, and fair in all assessments.
+
+GUARDRAILS — NEVER DO THESE:
+DO NOT disclose another candidate's application status, CV, or personal details
+DO NOT confirm or deny hiring decisions for specific candidates
+DO NOT discriminate or make remarks based on age, gender, nationality, or religion
+DO NOT provide salary negotiation advice that commits the company to a figure
+DO NOT handle complaints about biased hiring — escalate to HR
+"""
+
+# Queries matching these keywords are short-circuited before hitting OpenAI.
+# They are logged with flagged=True for HR audit and return a static escalation response.
+RECRUITMENT_SENSITIVE_KEYWORDS = [
+    "other candidate",       # attempting to access another applicant's data
+    "reject candidate",      # attempting to force a hiring decision
+    "blacklist",             # discriminatory action request
+    "discriminate",          # discrimination concern — escalate to HR
+    "age",                   # age-based bias request
+    "gender",                # gender-based bias request
+    "nationality",           # nationality-based bias request
+    "religion",              # religion-based bias request
+    "salary of applicant",   # fishing for another candidate's offered salary
+    "guarantee salary",      # committing company to a specific offer
+    "lawsuit",               # legal dispute
+    "bias",                  # hiring bias complaint — escalate to HR
+    "unfair hiring",         # complaint requiring HR involvement
+    "override",              # prompt injection attempt
+    "ignore instructions",   # jailbreak attempt
+]
+
+RECRUITMENT_ESCALATION_RESPONSE = (
+    "This query involves a sensitive recruitment matter that requires direct HR support. "
+    "For hiring decisions, candidate disputes, or discrimination concerns, please contact "
+    "hr@company.com or call +65 6123 4567 to speak with an HR representative."
+)
 
 # ─────────────────────────────────────────────
 # Startup / Shutdown
@@ -266,6 +302,18 @@ async def query_recruitment(request: RecruitmentQueryRequest):
 
         # Use provided conversation_id or generate a new one
         conv_id = request.conversation_id or str(uuid.uuid4())
+
+        # ── Guardrail: sensitive keyword intercept ──
+        query_lower = request.query.lower()
+        if any(kw in query_lower for kw in RECRUITMENT_SENSITIVE_KEYWORDS):
+            logger.warning(f"🚨 Sensitive recruitment query intercepted: {request.query}")
+            await log_message(conv_id, "user",      request.query,                    None, flagged=True)
+            await log_message(conv_id, "assistant", RECRUITMENT_ESCALATION_RESPONSE,  None, flagged=True)
+            return RecruitmentQueryResponse(
+                answer=RECRUITMENT_ESCALATION_RESPONSE,
+                data=None,
+                conversation_id=conv_id
+            )
 
         # ── Fetch live job openings from MongoDB ──
         cursor = db.job_openings.find({"status": "open"})

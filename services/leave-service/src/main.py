@@ -109,7 +109,8 @@ def calculate_leave_days(start_date: str, end_date: str) -> int:
         current += timedelta(days=1)
     return days
 
-async def log_message(conv_id: str, role: str, message: str, employee_id: str = None):
+async def log_message(conv_id: str, role: str, message: str, employee_id: str = None,
+                      flagged: bool = False):
     """Persist a single chat message. Never raises — logging must not break the main flow."""
     if db is None:
         return
@@ -120,6 +121,7 @@ async def log_message(conv_id: str, role: str, message: str, employee_id: str = 
             "employee_id": employee_id,
             "role": role,
             "message": message,
+            "flagged": flagged,
             "timestamp": datetime.now().isoformat()
         })
     except Exception as e:
@@ -193,7 +195,38 @@ Company Leave Policy:
 - Maximum consecutive leave: 14 days for annual leave
 
 Be professional and helpful. Provide clear information about leave balances and policies.
+
+GUARDRAILS — NEVER DO THESE:
+DO NOT disclose another employee's leave balance or leave history
+DO NOT approve or reject leave requests — that requires manager authorisation
+DO NOT grant extra leave days beyond what policy allows
+DO NOT advise on medical certification or diagnoses for sick leave
+DO NOT handle complaints about unfair leave treatment — escalate to HR
 """
+
+# Queries matching these keywords are short-circuited before hitting OpenAI.
+# They are logged with flagged=True for HR audit and return a static escalation response.
+LEAVE_SENSITIVE_KEYWORDS = [
+    "other employee",       # attempting to access another person's data
+    "everyone's leave",     # bulk leave data disclosure attempt
+    "leave balance of",     # fishing for another person's balance
+    "approve my leave",     # AI cannot approve — manager only
+    "force approve",        # attempting to bypass approval workflow
+    "extra leave",          # requesting out-of-policy leave allocation
+    "unlimited leave",      # policy violation request
+    "medical certificate",  # medical advice / certification guidance
+    "doctor's note",        # medical documentation advice
+    "harassment",           # workplace complaint — escalate to HR
+    "unfair",               # dispute requiring HR involvement
+    "override",             # prompt injection attempt
+    "ignore instructions",  # jailbreak attempt
+]
+
+LEAVE_ESCALATION_RESPONSE = (
+    "This query involves a sensitive leave matter that requires direct HR support. "
+    "For leave approvals, disputes, or policy exceptions, please contact hr@company.com "
+    "or call +65 6123 4567 to speak with an HR representative who can properly assist you."
+)
 
 # ─────────────────────────────────────────────
 # Startup / Shutdown
@@ -269,6 +302,18 @@ async def query_leave(request: LeaveQueryRequest):
 
         # Use provided conversation_id or generate a new one
         conv_id = request.conversation_id or str(uuid.uuid4())
+
+        # ── Guardrail: sensitive keyword intercept ──
+        query_lower = request.query.lower()
+        if any(kw in query_lower for kw in LEAVE_SENSITIVE_KEYWORDS):
+            logger.warning(f"🚨 Sensitive leave query intercepted: {request.query}")
+            await log_message(conv_id, "user",      request.query,             request.employee_id, flagged=True)
+            await log_message(conv_id, "assistant", LEAVE_ESCALATION_RESPONSE, request.employee_id, flagged=True)
+            return LeaveQueryResponse(
+                answer=LEAVE_ESCALATION_RESPONSE,
+                data=None,
+                conversation_id=conv_id
+            )
 
         # ── Build leave balance context from DB ──
         leave_context = ""

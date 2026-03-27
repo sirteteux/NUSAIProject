@@ -88,7 +88,7 @@ const AskAnything = () => {
         <h1 className="page-title">🤖 Ask Anything</h1>
         <p className="page-subtitle">
           <span className="badge" style={{ background: 'linear-gradient(135deg, #667eea 0%, #764ba2 100%)', color: 'white', padding: '6px 12px', borderRadius: '4px' }}>
-            🧠 COORDINATOR AI - LANGCHAIN
+            🧠 COORDINATOR AI
           </span>
           <br />
           Ask any HR question - I'll intelligently route it to the right expert!

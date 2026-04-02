@@ -1,286 +1,289 @@
 """
-Recruitment Agent - AI-Powered Hiring Assistant
-Handles job postings, candidate screening, resume analysis
+Recruitment Agent - AI Agent with tool calling.
 """
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional, Dict, List
-import os
+import os, json, uuid, traceback
 from dotenv import load_dotenv
 import logging
 from openai import OpenAI
 from datetime import datetime
 import uvicorn
-import uuid
 from motor.motor_asyncio import AsyncIOMotorClient
 from bson import ObjectId
 
 load_dotenv()
-
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-app = FastAPI(
-    title="Recruitment Agent",
-    description="AI-Powered Hiring Assistant",
-    version="1.0.0"
-)
+app = FastAPI(title="Recruitment Agent", description="Hiring AI Agent with tool calling", version="2.0.0")
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# ─────────────────────────────────────────────
-# OpenAI Setup
-# ─────────────────────────────────────────────
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-if not OPENAI_API_KEY:
-    logger.error("❌ OPENAI_API_KEY not found!")
-else:
-    logger.info("✅ OpenAI API Key configured")
+client         = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
+MONGODB_URL    = os.getenv("DATABASE_URL", "mongodb://localhost:27017")
+DB_NAME        = os.getenv("DB_NAME", "recruitment_db")
+mongo_client   = None
+db             = None
 
-client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
+CONTEXT_MARKER = "[Prior conversation context:"
 
-# ─────────────────────────────────────────────
-# MongoDB Setup
-# ─────────────────────────────────────────────
-MONGODB_URL = os.getenv("DATABASE_URL", "mongodb://localhost:27017")
-DB_NAME = os.getenv("DB_NAME", "recruitment_db")
-
-mongo_client: AsyncIOMotorClient = None
-db = None
-
-# ─────────────────────────────────────────────
-# Pydantic Models
-# ─────────────────────────────────────────────
 class RecruitmentQueryRequest(BaseModel):
     query: str
     context: Optional[str] = None
-    conversation_id: Optional[str] = None      # ← thread identifier
+    conversation_id: Optional[str] = None
 
 class RecruitmentQueryResponse(BaseModel):
     answer: str
     data: Optional[Dict] = None
-    conversation_id: str                        # ← returned so frontend can reuse it
+    conversation_id: str
+    tools_used: List[str] = []
 
-class JobOpening(BaseModel):
-    title: str
-    department: str
-    location: str
-    type: str
-    experience: str
-    skills: List[str]
-    description: str
-    salary_range: str
-    status: str = "open"
-    posted: str = datetime.now().strftime("%Y-%m-%d")
-
-# ─────────────────────────────────────────────
-# Helpers
-# ─────────────────────────────────────────────
-def serialize_doc(doc: dict) -> dict:
-    if doc and "_id" in doc:
-        doc["id"] = str(doc["_id"])
-        del doc["_id"]
-    return doc
-
-async def log_message(conv_id: str, role: str, message: str, user_id: str = None,
-                      flagged: bool = False):
-    """Persist a single chat message. Never raises — logging must not break the main flow."""
-    if db is None:
-        return
-    try:
-        await db.chat_history.insert_one({
-            "conversation_id": conv_id,
-            "service": "recruitment",
-            "user_id": user_id,
-            "role": role,
-            "message": message,
-            "flagged": flagged,
-            "timestamp": datetime.now().isoformat()
-        })
-    except Exception as e:
-        logger.warning(f"⚠️ Failed to log message: {str(e)}")
-
-async def get_conversation_history(conv_id: str, limit: int = 10) -> List[Dict]:
-    """Fetch the last N messages for a conversation, oldest-first for correct context order."""
-    if db is None:
-        return []
-    try:
-        cursor = db.chat_history.find(
-            {"conversation_id": conv_id},
-            sort=[("timestamp", 1)]
-        ).limit(limit)
-        return await cursor.to_list(length=limit)
-    except Exception as e:
-        logger.warning(f"⚠️ Failed to fetch history: {str(e)}")
-        return []
-
-# ─────────────────────────────────────────────
-# Seed Data
-# ─────────────────────────────────────────────
-SEED_JOB_OPENINGS = [
-    {
-        "title": "Senior Software Engineer",
-        "department": "Engineering",
-        "location": "Singapore",
-        "type": "Full-time",
-        "experience": "5+ years",
-        "skills": ["Python", "React", "AWS", "Docker", "Kubernetes"],
-        "description": "Lead backend development team, design scalable systems, mentor junior developers.",
-        "posted": "2025-02-01",
-        "status": "open",
-        "salary_range": "SGD 8,000 - 12,000"
-    },
-    {
-        "title": "HR Manager",
-        "department": "Human Resources",
-        "location": "Singapore",
-        "type": "Full-time",
-        "experience": "3+ years",
-        "skills": ["HR Management", "Recruitment", "Employee Relations", "Labor Law"],
-        "description": "Lead HR department, drive talent acquisition, manage employee relations.",
-        "posted": "2025-01-28",
-        "status": "open",
-        "salary_range": "SGD 6,000 - 8,000"
-    },
-    {
-        "title": "Marketing Specialist",
-        "department": "Marketing",
-        "location": "Remote",
-        "type": "Full-time",
-        "experience": "2+ years",
-        "skills": ["Digital Marketing", "SEO", "Content Creation", "Analytics"],
-        "description": "Drive digital marketing campaigns, manage social media, analyze performance.",
-        "posted": "2025-02-05",
-        "status": "open",
-        "salary_range": "SGD 4,500 - 6,500"
-    },
-    {
-        "title": "Data Scientist",
-        "department": "Analytics",
-        "location": "Singapore",
-        "type": "Full-time",
-        "experience": "3+ years",
-        "skills": ["Python", "Machine Learning", "SQL", "Statistics", "TensorFlow"],
-        "description": "Build ML models, create data pipelines, provide business insights.",
-        "posted": "2025-02-03",
-        "status": "open",
-        "salary_range": "SGD 7,000 - 10,000"
-    }
+RECRUITMENT_SENSITIVE_KEYWORDS = [
+    "other candidate", "reject candidate", "blacklist", "discriminate",
+    "gender", "nationality", "religion", "guarantee salary",
+    "lawsuit", "unfair hiring", "override", "ignore instructions",
 ]
+RECRUITMENT_ESCALATION_RESPONSE = (
+    "This query involves a sensitive recruitment matter that requires direct HR support. "
+    "Please contact hr@company.com or call +65 6123 4567."
+)
 
-SYSTEM_PROMPT = """You are a professional Recruitment AI Assistant — a fair, data-driven, and professional virtual assistant supporting hiring processes. 
+RECRUITMENT_SYSTEM_PROMPT = """You are a professional Recruitment AI Agent for ResourcefulAI — a fair, data-driven, and professional virtual assistant supporting hiring processes.  You have tools to look up real job data.
 
 Answer the user’s recruitment-related query using ONLY the company recruitment policies provided.
 Provide guidance on hiring processes, candidate evaluation, or recruitment practices where applicable.
 If the query involves confidential information or restricted topics, do not answer and instead advise contacting HR.
 
-You help with:
-- Job posting and requirements
-- Candidate screening and evaluation
-- Interview scheduling
-- Recruitment process guidance
-- Hiring best practices
+Use tools to retrieve accurate job information before answering. You can:
+- Search for open positions by department or location
+- Get detailed job requirements
+- Check how many open positions exist
+- Create new job postings (HR only)
 
-Company Recruitment Policies:
-- Application review: 3-5 business days
-- Interview process: 2-3 rounds (Phone screen, Technical, Final)
-- Background checks required for all hires
-- Standard notice period: 1 month
-- Probation period: 3 months
+GUARDRAILS:
+- Do not disclose candidate data or application statuses
+- Do not make discriminatory remarks about candidates
+- Do not commit to salary offers without HR approval
+- Provide fair, accurate information to all enquirers"""
 
-Be professional, data-driven, and fair in all assessments.
-
-RESPONSE FORMAT:
-- Respond in clear bullet points
-- Keep answers concise (3-5 bullets)
-- Base responses on company policies where relevant
-- Do NOT include unnecessary explanations
-
-GUARDRAILS — NEVER DO THESE:
-DO NOT disclose another candidate's application status, CV, or personal details
-DO NOT confirm or deny hiring decisions for specific candidates
-DO NOT discriminate or make remarks based on age, gender, nationality, or religion
-DO NOT provide salary negotiation advice that commits the company to a figure
-DO NOT handle complaints about biased hiring — escalate to HR
-"""
-
-# Queries matching these keywords are short-circuited before hitting OpenAI.
-# They are logged with flagged=True for HR audit and return a static escalation response.
-RECRUITMENT_SENSITIVE_KEYWORDS = [
-    "other candidate",       # attempting to access another applicant's data
-    "reject candidate",      # attempting to force a hiring decision
-    "blacklist",             # discriminatory action request
-    "discriminate",          # discrimination concern — escalate to HR
-    "age",                   # age-based bias request
-    "gender",                # gender-based bias request
-    "nationality",           # nationality-based bias request
-    "religion",              # religion-based bias request
-    "salary of applicant",   # fishing for another candidate's offered salary
-    "guarantee salary",      # committing company to a specific offer
-    "lawsuit",               # legal dispute
-    "bias",                  # hiring bias complaint — escalate to HR
-    "unfair hiring",         # complaint requiring HR involvement
-    "override",              # prompt injection attempt
-    "ignore instructions",   # jailbreak attempt
+# ─────────────────────────────────────────────
+# Tool Definitions
+# ─────────────────────────────────────────────
+RECRUITMENT_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "search_job_openings",
+            "description": "Search for open job positions, optionally filtered by department or location. Returns a list of matching jobs.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "department": {"type": "string", "description": "Filter by department name (optional)"},
+                    "location":   {"type": "string", "description": "Filter by location (optional)"},
+                    "status":     {"type": "string", "enum": ["open", "closed", "all"], "description": "Filter by job status (default: open)"}
+                },
+                "required": []
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_job_details",
+            "description": "Get full details of a specific job opening including description, required skills, salary range, and experience requirements.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "job_id": {"type": "string", "description": "The MongoDB job ID"}
+                },
+                "required": ["job_id"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_recruitment_stats",
+            "description": "Get summary statistics: total open positions, breakdown by department, and recently posted jobs.",
+            "parameters": {"type": "object", "properties": {}, "required": []}
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "create_job_posting",
+            "description": "Create a new job posting. This is an HR-only action.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "title":        {"type": "string"},
+                    "department":   {"type": "string"},
+                    "location":     {"type": "string"},
+                    "type":         {"type": "string", "enum": ["Full-time", "Part-time", "Contract"]},
+                    "experience":   {"type": "string", "description": "e.g. '3+ years'"},
+                    "skills":       {"type": "array", "items": {"type": "string"}},
+                    "description":  {"type": "string"},
+                    "salary_range": {"type": "string", "description": "e.g. 'SGD 5,000 - 7,000'"}
+                },
+                "required": ["title", "department", "location", "type", "experience", "skills", "description", "salary_range"]
+            }
+        }
+    }
 ]
 
-RECRUITMENT_ESCALATION_RESPONSE = (
-    "This query involves a sensitive recruitment matter that requires direct HR support. "
-    "For hiring decisions, candidate disputes, or discrimination concerns, please contact "
-    "hr@company.com or call +65 6123 4567 to speak with an HR representative."
-)
+# ─────────────────────────────────────────────
+# Helpers
+# ─────────────────────────────────────────────
+def serialize_doc(doc):
+    if doc and "_id" in doc:
+        doc["id"] = str(doc["_id"])
+        del doc["_id"]
+    return doc
+
+async def log_message(conv_id, role, message, user_id=None, flagged=False):
+    if db is None:
+        return
+    try:
+        await db.chat_history.insert_one({
+            "conversation_id": conv_id, "service": "recruitment",
+            "user_id": user_id, "role": role, "message": message,
+            "flagged": flagged, "timestamp": datetime.now().isoformat()
+        })
+    except Exception as e:
+        logger.warning(f"⚠️ log_message failed: {str(e)}")
+
+async def get_conversation_history(conv_id, limit=10):
+    if db is None:
+        return []
+    try:
+        cursor = db.chat_history.find({"conversation_id": conv_id}, sort=[("timestamp", 1)]).limit(limit)
+        return await cursor.to_list(length=limit)
+    except Exception as e:
+        logger.warning(f"⚠️ get_history failed: {str(e)}")
+        return []
 
 # ─────────────────────────────────────────────
-# Startup / Shutdown
+# Tool Executor
 # ─────────────────────────────────────────────
+async def execute_tool(tool_name: str, tool_args: dict) -> str:
+    try:
+        if tool_name == "search_job_openings":
+            query_filter = {}
+            status = tool_args.get("status", "open")
+            if status != "all":
+                query_filter["status"] = status
+            if tool_args.get("department"):
+                query_filter["department"] = {"$regex": tool_args["department"], "$options": "i"}
+            if tool_args.get("location"):
+                query_filter["location"] = {"$regex": tool_args["location"], "$options": "i"}
+
+            cursor = db.job_openings.find(query_filter)
+            jobs   = await cursor.to_list(length=50)
+            jobs   = [serialize_doc(j) for j in jobs]
+            return json.dumps({"total": len(jobs), "jobs": jobs})
+
+        elif tool_name == "get_job_details":
+            try:
+                oid = ObjectId(tool_args["job_id"])
+            except Exception:
+                return json.dumps({"error": "Invalid job ID format"})
+            job = await db.job_openings.find_one({"_id": oid})
+            if not job:
+                return json.dumps({"error": "Job not found"})
+            return json.dumps(serialize_doc(job))
+
+        elif tool_name == "get_recruitment_stats":
+            total     = await db.job_openings.count_documents({"status": "open"})
+            pipeline  = [
+                {"$match": {"status": "open"}},
+                {"$group": {"_id": "$department", "count": {"$sum": 1}}}
+            ]
+            by_dept   = await db.job_openings.aggregate(pipeline).to_list(length=20)
+            recent    = await db.job_openings.find(
+                {"status": "open"}, sort=[("posted", -1)]
+            ).limit(3).to_list(length=3)
+            return json.dumps({
+                "total_open": total,
+                "by_department": {d["_id"]: d["count"] for d in by_dept},
+                "recently_posted": [{"title": j["title"], "department": j["department"], "posted": j["posted"]}
+                                     for j in recent]
+            })
+
+        elif tool_name == "create_job_posting":
+            job = {
+                "title":        tool_args["title"],
+                "department":   tool_args["department"],
+                "location":     tool_args["location"],
+                "type":         tool_args["type"],
+                "experience":   tool_args["experience"],
+                "skills":       tool_args["skills"],
+                "description":  tool_args["description"],
+                "salary_range": tool_args["salary_range"],
+                "status":       "open",
+                "posted":       datetime.now().strftime("%Y-%m-%d")
+            }
+            result = await db.job_openings.insert_one(job)
+            logger.info(f"✅ New job posting created: {tool_args['title']}")
+            return json.dumps({"success": True, "job_id": str(result.inserted_id),
+                               "message": f"Job posting '{tool_args['title']}' created successfully."})
+
+        else:
+            return json.dumps({"error": f"Unknown tool: {tool_name}"})
+
+    except Exception as e:
+        logger.error(f"❌ Tool {tool_name} failed: {str(e)}")
+        return json.dumps({"error": str(e)})
+
+# ─────────────────────────────────────────────
+# Seed Data
+# ─────────────────────────────────────────────
+SEED_JOBS = [
+    {"title": "Senior Software Engineer", "department": "Engineering",
+     "location": "Singapore", "type": "Full-time", "experience": "5+ years",
+     "skills": ["Python", "React", "AWS", "Docker", "Kubernetes"],
+     "description": "Lead backend development team, design scalable systems.",
+     "posted": "2025-02-01", "status": "open", "salary_range": "SGD 8,000 - 12,000"},
+    {"title": "HR Manager", "department": "Human Resources",
+     "location": "Singapore", "type": "Full-time", "experience": "3+ years",
+     "skills": ["HR Management", "Recruitment", "Employee Relations"],
+     "description": "Lead HR department, drive talent acquisition.",
+     "posted": "2025-01-28", "status": "open", "salary_range": "SGD 6,000 - 8,000"},
+    {"title": "Marketing Specialist", "department": "Marketing",
+     "location": "Remote", "type": "Full-time", "experience": "2+ years",
+     "skills": ["Digital Marketing", "SEO", "Content Creation"],
+     "description": "Drive digital marketing campaigns.",
+     "posted": "2025-02-05", "status": "open", "salary_range": "SGD 4,500 - 6,500"},
+    {"title": "Data Scientist", "department": "Analytics",
+     "location": "Singapore", "type": "Full-time", "experience": "3+ years",
+     "skills": ["Python", "Machine Learning", "SQL", "TensorFlow"],
+     "description": "Build ML models, create data pipelines.",
+     "posted": "2025-02-03", "status": "open", "salary_range": "SGD 7,000 - 10,000"},
+]
+
 @app.on_event("startup")
 async def startup_event():
     global mongo_client, db
-
-    logger.info("=" * 50)
-    logger.info("🚀 Recruitment Agent Starting Up")
-    logger.info("=" * 50)
-    logger.info(f"OpenAI API:  {'✅ Configured' if OPENAI_API_KEY else '❌ Missing'}")
-    logger.info(f"MongoDB URL: {MONGODB_URL}")
-
+    logger.info("🚀 Recruitment Agent v2 Starting (with tool calling)")
     try:
         mongo_client = AsyncIOMotorClient(MONGODB_URL)
         db = mongo_client[DB_NAME]
         await mongo_client.admin.command("ping")
-        logger.info("✅ MongoDB connected successfully")
-
+        logger.info("✅ MongoDB connected")
         if await db.job_openings.count_documents({}) == 0:
-            await db.job_openings.insert_many(SEED_JOB_OPENINGS)
-            logger.info(f"🌱 Seeded {len(SEED_JOB_OPENINGS)} job openings")
-        else:
-            count = await db.job_openings.count_documents({})
-            logger.info(f"📋 Found {count} existing job openings in MongoDB")
-
+            await db.job_openings.insert_many(SEED_JOBS)
+            logger.info(f"🌱 Seeded {len(SEED_JOBS)} job openings")
     except Exception as e:
-        logger.error(f"❌ MongoDB connection failed: {str(e)}")
-
-    logger.info("=" * 50)
+        logger.error(f"❌ MongoDB failed: {str(e)}")
 
 @app.on_event("shutdown")
 async def shutdown_event():
     if mongo_client:
         mongo_client.close()
-        logger.info("🔌 MongoDB connection closed")
 
-# ─────────────────────────────────────────────
-# Health Check
-# ─────────────────────────────────────────────
 @app.get("/health")
 async def health_check():
     mongo_status = "disconnected"
@@ -290,204 +293,137 @@ async def health_check():
             mongo_status = "connected"
     except Exception:
         mongo_status = "error"
-
-    return {
-        "status": "healthy",
-        "service": "recruitment-agent",
-        "version": "1.0.0",
-        "openai_status": "configured" if OPENAI_API_KEY else "missing",
-        "mongodb_status": mongo_status
-    }
+    return {"status": "healthy", "service": "recruitment-agent", "version": "2.0.0",
+            "openai_status": "configured" if OPENAI_API_KEY else "missing",
+            "mongodb_status": mongo_status, "mode": "agentic-tool-calling"}
 
 # ─────────────────────────────────────────────
-# AI Query — Level 1 Conversational Memory
+# AI Query Endpoint — Agentic Loop
 # ─────────────────────────────────────────────
 @app.post("/api/recruitment/query", response_model=RecruitmentQueryResponse)
 async def query_recruitment(request: RecruitmentQueryRequest):
     try:
         logger.info(f"📥 Recruitment query: {request.query}")
-
         if not client:
             raise HTTPException(status_code=500, detail="OpenAI not configured")
         if db is None:
             raise HTTPException(status_code=500, detail="Database not connected")
 
-        # Use provided conversation_id or generate a new one
         conv_id = request.conversation_id or str(uuid.uuid4())
 
-        # ── Strip coordinator context before guardrail check ──────────────────
-        CONTEXT_MARKER = "[Prior conversation context:"
         original_query = request.query
         if CONTEXT_MARKER in request.query:
             original_query = request.query.split(CONTEXT_MARKER)[0].strip()
 
-        # ── Guardrail: sensitive keyword intercept (original query only) ──────
-        query_lower = original_query.lower()
-        if any(kw in query_lower for kw in RECRUITMENT_SENSITIVE_KEYWORDS):
-            logger.warning(f"🚨 Sensitive recruitment query intercepted: {original_query}")
+        if any(kw in original_query.lower() for kw in RECRUITMENT_SENSITIVE_KEYWORDS):
+            logger.warning(f"🚨 Sensitive recruitment query: {original_query}")
             await log_message(conv_id, "user",      request.query,                    None, flagged=True)
             await log_message(conv_id, "assistant", RECRUITMENT_ESCALATION_RESPONSE,  None, flagged=True)
-            return RecruitmentQueryResponse(
-                answer=RECRUITMENT_ESCALATION_RESPONSE,
-                data=None,
-                conversation_id=conv_id
-            )
+            return RecruitmentQueryResponse(answer=RECRUITMENT_ESCALATION_RESPONSE,
+                                            data=None, conversation_id=conv_id, tools_used=[])
 
-        # ── Fetch live job openings from MongoDB ──
-        cursor = db.job_openings.find({"status": "open"})
-        open_jobs = await cursor.to_list(length=100)
-
-        openings_context = f"\nCurrent Open Positions ({len(open_jobs)}):\n"
-        for job in open_jobs[:5]:
-            openings_context += (
-                f"- {job['title']} ({job['department']}) | "
-                f"{job['location']} | {job['salary_range']}\n"
-            )
-
-        # ── Start messages with system prompt ──
-        messages = [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "system", "content": openings_context},
-        ]
-
+        messages = [{"role": "system", "content": RECRUITMENT_SYSTEM_PROMPT}]
         if request.context:
             messages.append({"role": "system", "content": f"Additional context: {request.context}"})
 
-        # ── Inject conversation history for Level 1 memory ──
         history = await get_conversation_history(conv_id, limit=10)
         for msg in history:
             messages.append({"role": msg["role"], "content": msg["message"]})
-
-        logger.info(f"💬 Injecting {len(history)} previous messages into context")
-
-        # ── Append current user message ──
         messages.append({"role": "user", "content": request.query})
 
-        # ── Call OpenAI ──
-        response = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=messages,
-            temperature=0.3,
-            max_tokens=500
-        )
+        tools_used     = []
+        job_data       = None
+        max_iterations = 5
 
-        answer = response.choices[0].message.content.strip()
-        logger.info("✅ Generated recruitment response")
+        for iteration in range(max_iterations):
+            logger.info(f"🔄 Recruitment agent iteration {iteration + 1}")
+            response = client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=messages,
+                tools=RECRUITMENT_TOOLS,
+                tool_choice="auto",
+                temperature=0.3,
+                max_tokens=600
+            )
 
-        # ── Persist both sides of the exchange ──
-        await log_message(conv_id, "user",      request.query, None)
-        await log_message(conv_id, "assistant", answer,        None)
+            msg = response.choices[0].message
+            messages.append(msg)
 
-        return RecruitmentQueryResponse(
-            answer=answer,
-            data={"open_positions": len(open_jobs)},
-            conversation_id=conv_id
-        )
+            if not msg.tool_calls:
+                answer = msg.content.strip() if msg.content else "I was unable to generate a response."
+                logger.info(f"✅ Recruitment agent done after {iteration + 1} iteration(s)")
+                await log_message(conv_id, "user",      request.query, None)
+                await log_message(conv_id, "assistant", answer,        None)
+                return RecruitmentQueryResponse(answer=answer, data=job_data,
+                                                conversation_id=conv_id, tools_used=tools_used)
+
+            for tool_call in msg.tool_calls:
+                tool_name   = tool_call.function.name
+                tool_args   = json.loads(tool_call.function.arguments)
+                logger.info(f"🔧 Recruitment calling tool: {tool_name}({tool_args})")
+                tool_result = await execute_tool(tool_name, tool_args)
+                tools_used.append(tool_name)
+
+                if tool_name == "get_recruitment_stats":
+                    try:
+                        job_data = json.loads(tool_result)
+                    except Exception:
+                        pass
+
+                messages.append({"role": "tool", "tool_call_id": tool_call.id, "content": tool_result})
+
+        answer = "I reached the maximum reasoning steps. Please try rephrasing your question."
+        await log_message(conv_id, "user", request.query, None)
+        await log_message(conv_id, "assistant", answer, None)
+        return RecruitmentQueryResponse(answer=answer, data=None, conversation_id=conv_id, tools_used=tools_used)
 
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"❌ Error in query_recruitment: {str(e)}")
+        logger.error(f"❌ Recruitment error: {traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=str(e))
 
-# ─────────────────────────────────────────────
-# Job Openings Endpoints
-# ─────────────────────────────────────────────
 @app.get("/api/recruitment/openings")
 async def get_openings(department: Optional[str] = None, location: Optional[str] = None):
-    try:
-        if db is None:
-            raise HTTPException(status_code=500, detail="Database not connected")
-
-        query_filter: Dict = {}
-        if department:
-            query_filter["department"] = {"$regex": f"^{department}$", "$options": "i"}
-        if location:
-            query_filter["location"] = {"$regex": location, "$options": "i"}
-
-        cursor = db.job_openings.find(query_filter)
-        openings = await cursor.to_list(length=100)
-        openings = [serialize_doc(job) for job in openings]
-
-        return {"openings": openings, "total": len(openings)}
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"❌ Error in get_openings: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
+    if db is None:
+        raise HTTPException(status_code=500, detail="Database not connected")
+    query_filter = {}
+    if department:
+        query_filter["department"] = {"$regex": department, "$options": "i"}
+    if location:
+        query_filter["location"] = {"$regex": location, "$options": "i"}
+    cursor   = db.job_openings.find(query_filter)
+    openings = await cursor.to_list(length=100)
+    return {"openings": [serialize_doc(j) for j in openings], "total": len(openings)}
 
 @app.get("/api/recruitment/opening/{job_id}")
 async def get_opening(job_id: str):
-    try:
-        if db is None:
-            raise HTTPException(status_code=500, detail="Database not connected")
-
-        try:
-            oid = ObjectId(job_id)
-        except Exception:
-            raise HTTPException(status_code=400, detail="Invalid job ID format")
-
-        job = await db.job_openings.find_one({"_id": oid})
-        if not job:
-            raise HTTPException(status_code=404, detail="Job not found")
-
-        return serialize_doc(job)
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"❌ Error in get_opening: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.post("/api/recruitment/openings")
-async def create_opening(job: JobOpening):
-    try:
-        if db is None:
-            raise HTTPException(status_code=500, detail="Database not connected")
-
-        result = await db.job_openings.insert_one(job.dict())
-        logger.info(f"✅ Created new job opening: {job.title}")
-        return {"id": str(result.inserted_id), "message": "Job opening created successfully"}
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"❌ Error in create_opening: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-# ─────────────────────────────────────────────
-# Chat History Endpoints
-# ─────────────────────────────────────────────
-@app.get("/api/recruitment/history/chat")
-async def get_chat_history(limit: int = 50):
-    """All recent recruitment chat messages."""
     if db is None:
         raise HTTPException(status_code=500, detail="Database not connected")
+    try:
+        oid = ObjectId(job_id)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid job ID")
+    job = await db.job_openings.find_one({"_id": oid})
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    return serialize_doc(job)
 
-    cursor = db.chat_history.find(
-        {"service": "recruitment"},
-        sort=[("timestamp", -1)]
-    ).limit(limit)
-
+@app.get("/api/recruitment/history/chat")
+async def get_chat_history(limit: int = 50):
+    if db is None:
+        raise HTTPException(status_code=500, detail="Database not connected")
+    cursor = db.chat_history.find({"service": "recruitment"}, sort=[("timestamp", -1)]).limit(limit)
     history = await cursor.to_list(length=limit)
     return {"history": [serialize_doc(h) for h in history]}
 
 @app.get("/api/recruitment/history/chat/{conversation_id}")
 async def get_conversation(conversation_id: str):
-    """All messages in a specific conversation thread, in chronological order."""
     if db is None:
         raise HTTPException(status_code=500, detail="Database not connected")
-
-    cursor = db.chat_history.find(
-        {"conversation_id": conversation_id},
-        sort=[("timestamp", 1)]
-    )
-
+    cursor = db.chat_history.find({"conversation_id": conversation_id}, sort=[("timestamp", 1)])
     messages = await cursor.to_list(length=200)
     return {"conversation_id": conversation_id, "messages": [serialize_doc(m) for m in messages]}
 
-
 if __name__ == "__main__":
-    port = int(os.getenv("PORT", 8005))
-    uvicorn.run(app, host="0.0.0.0", port=port)
+    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 8005)))

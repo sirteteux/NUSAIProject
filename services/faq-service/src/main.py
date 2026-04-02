@@ -1,6 +1,9 @@
 """
 FAQ Agent - HR Knowledge Base Assistant
-Answers common HR questions using OpenAI
+Upgraded to true AI agent with OpenAI tool calling.
+
+Agentic loop: model decides which tools to call, sees results,
+calls more tools if needed, then generates a grounded final answer.
 """
 
 from fastapi import FastAPI, HTTPException
@@ -14,55 +17,23 @@ from openai import OpenAI
 import uvicorn
 import traceback
 import uuid
+import json
 from motor.motor_asyncio import AsyncIOMotorClient
-from bson import ObjectId
 from datetime import datetime
 
 load_dotenv()
-
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-app = FastAPI(
-    title="FAQ Agent",
-    description="HR Knowledge Base Assistant",
-    version="1.0.0"
-)
+app = FastAPI(title="FAQ Agent", description="HR Knowledge Base AI Agent", version="2.0.0")
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# ─────────────────────────────────────────────
-# OpenAI Setup
-# ─────────────────────────────────────────────
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-if not OPENAI_API_KEY:
-    logger.error("❌ OPENAI_API_KEY not found in environment variables!")
-else:
-    logger.info(f"✅ OpenAI API Key found (starts with: {OPENAI_API_KEY[:20]}...)")
+client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 
-try:
-    client = OpenAI(api_key=OPENAI_API_KEY)
-    logger.info("✅ OpenAI client initialized successfully")
-except Exception as e:
-    logger.error(f"❌ Failed to initialize OpenAI client: {str(e)}")
-    client = None
-
-# ─────────────────────────────────────────────
-# MongoDB Setup
-# ─────────────────────────────────────────────
 MONGODB_URL = os.getenv("DATABASE_URL", "mongodb://localhost:27017")
-DB_NAME = os.getenv("DB_NAME", "faq_db")
-
-mongo_client: AsyncIOMotorClient = None
+DB_NAME     = os.getenv("DB_NAME", "faq_db")
+mongo_client = None
 db = None
 
 # ─────────────────────────────────────────────
@@ -71,59 +42,173 @@ db = None
 class QuestionRequest(BaseModel):
     question: str
     user_id: Optional[str] = None
-    conversation_id: Optional[str] = None      # ← thread identifier
+    conversation_id: Optional[str] = None
 
 class QuestionResponse(BaseModel):
     answer: str
     question: str
     confidence: float = 0.95
-    conversation_id: str                        # ← returned so frontend can reuse it
+    conversation_id: str
+    tools_used: List[str] = []
+
+# ─────────────────────────────────────────────
+# Guardrails
+# ─────────────────────────────────────────────
+SENSITIVE_KEYWORDS = ['salary', 'fire', 'terminate', 'lawsuit', 'harassment', 'discrimination']
+CONTEXT_MARKER     = "[Prior conversation context:"
+
+SYSTEM_PROMPT = """You are ResourcefulAI's HR Knowledge Assistant — a helpful, professional virtual assistant for employees.
+
+Answer the users HR-related query using ONLY the company information provided.
+If the question is outside your scope or information is missing, direct the user to HR at hr@company.com.
+You have access to tools that let you look up real company data. Always use tools to retrieve
+accurate information before answering. Do not answer from memory alone when a tool can verify it.
+
+## CAPABILITIES
+- Company policies and procedures
+- Working hours, remote work policies
+- Leave entitlements and benefits
+- Office locations and facilities
+- Onboarding, training, career development
+
+## COMPANY INFORMATION
+Company: ResourcefulAI | Office: 123 Business Street, Singapore 018956
+Hours: Mon-Fri 9AM-6PM SGT | HR: hr@company.com | +65 6123 4567
+Dress: Business casual (smart casual Fridays)
+
+## GUARDRAILS — NEVER DO THESE
+DO NOT provide medical, legal, or financial advice
+DO NOT discuss other employees' personal information or salaries
+DO NOT handle harassment/discrimination complaints (escalate to HR)
+DO NOT make commitments on behalf of management"""
+
+# ─────────────────────────────────────────────
+# Tool Definitions
+# ─────────────────────────────────────────────
+FAQ_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "get_popular_questions",
+            "description": "Retrieve the most frequently asked HR questions, sorted by view count. Use this to understand what employees commonly ask about.",
+            "parameters": {"type": "object", "properties": {}, "required": []}
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_faq_categories",
+            "description": "Retrieve all available FAQ categories (e.g. policies, leave, benefits, office). Use this to understand the scope of HR knowledge available.",
+            "parameters": {"type": "object", "properties": {}, "required": []}
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "search_question_logs",
+            "description": "Search historical question logs to find how similar questions were handled in the past. Useful for consistency.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "keyword": {"type": "string", "description": "Keyword to search for in past questions"}
+                },
+                "required": ["keyword"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "escalate_to_hr",
+            "description": "Escalate a sensitive question to HR and log it. Use for harassment, discrimination, salary disputes, or legal matters.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "reason": {"type": "string", "description": "Why this is being escalated"},
+                    "user_id": {"type": "string", "description": "User ID if available"}
+                },
+                "required": ["reason"]
+            }
+        }
+    }
+]
+
+# ─────────────────────────────────────────────
+# Tool Executor
+# ─────────────────────────────────────────────
+async def execute_tool(tool_name: str, tool_args: dict, user_id: str = None) -> str:
+    """Execute a tool call and return result as string."""
+    try:
+        if tool_name == "get_popular_questions":
+            cursor = db.popular_questions.find({}, {"_id": 0, "question": 1}).sort("views", -1).limit(10)
+            docs = await cursor.to_list(length=10)
+            return json.dumps([d["question"] for d in docs])
+
+        elif tool_name == "get_faq_categories":
+            cursor = db.categories.find({}, {"_id": 0})
+            cats = await cursor.to_list(length=20)
+            return json.dumps(cats)
+
+        elif tool_name == "search_question_logs":
+            keyword = tool_args.get("keyword", "")
+            cursor = db.question_logs.find(
+                {"question": {"$regex": keyword, "$options": "i"}},
+                {"_id": 0, "question": 1, "timestamp": 1}
+            ).sort("timestamp", -1).limit(5)
+            logs = await cursor.to_list(length=5)
+            return json.dumps(logs if logs else [{"message": "No similar questions found"}])
+
+        elif tool_name == "escalate_to_hr":
+            reason  = tool_args.get("reason", "unspecified")
+            uid     = tool_args.get("user_id", user_id or "anonymous")
+            await db.escalations.insert_one({
+                "user_id": uid, "reason": reason,
+                "timestamp": datetime.now().isoformat()
+            })
+            return json.dumps({"status": "escalated", "message": "HR has been notified", "contact": "hr@company.com"})
+
+        else:
+            return json.dumps({"error": f"Unknown tool: {tool_name}"})
+
+    except Exception as e:
+        logger.error(f"❌ Tool {tool_name} failed: {str(e)}")
+        return json.dumps({"error": str(e)})
 
 # ─────────────────────────────────────────────
 # Helpers
 # ─────────────────────────────────────────────
-def serialize_doc(doc: dict) -> dict:
+async def log_message(conv_id, role, message, user_id=None, flagged=False):
+    if db is None:
+        return
+    try:
+        await db.chat_history.insert_one({
+            "conversation_id": conv_id, "service": "faq",
+            "user_id": user_id, "role": role, "message": message,
+            "flagged": flagged, "timestamp": datetime.now().isoformat()
+        })
+    except Exception as e:
+        logger.warning(f"⚠️ log_message failed: {str(e)}")
+
+async def get_conversation_history(conv_id, limit=10):
+    if db is None:
+        return []
+    try:
+        cursor = db.chat_history.find({"conversation_id": conv_id}, sort=[("timestamp", 1)]).limit(limit)
+        return await cursor.to_list(length=limit)
+    except Exception as e:
+        logger.warning(f"⚠️ get_history failed: {str(e)}")
+        return []
+
+def serialize_doc(doc):
     if doc and "_id" in doc:
         doc["id"] = str(doc["_id"])
         del doc["_id"]
     return doc
 
-async def log_message(conv_id: str, role: str, message: str, user_id: str = None,
-                      flagged: bool = False):
-    """Persist a single chat message. Never raises — logging must not break the main flow."""
-    if db is None:
-        return
-    try:
-        await db.chat_history.insert_one({
-            "conversation_id": conv_id,
-            "service": "faq",
-            "user_id": user_id,
-            "role": role,
-            "message": message,
-            "flagged": flagged,
-            "timestamp": datetime.now().isoformat()
-        })
-    except Exception as e:
-        logger.warning(f"⚠️ Failed to log message: {str(e)}")
-
-async def get_conversation_history(conv_id: str, limit: int = 10) -> List[Dict]:
-    """Fetch the last N messages for a conversation, oldest-first for correct context order."""
-    if db is None:
-        return []
-    try:
-        cursor = db.chat_history.find(
-            {"conversation_id": conv_id},
-            sort=[("timestamp", 1)]
-        ).limit(limit)
-        return await cursor.to_list(length=limit)
-    except Exception as e:
-        logger.warning(f"⚠️ Failed to fetch history: {str(e)}")
-        return []
-
 # ─────────────────────────────────────────────
 # Seed Data
 # ─────────────────────────────────────────────
-SEED_POPULAR_QUESTIONS = [
+SEED_POPULAR = [
     {"question": "What are the company's working hours?",    "category": "policies",  "views": 120},
     {"question": "How do I request vacation leave?",         "category": "leave",     "views": 98},
     {"question": "What is the dress code policy?",           "category": "policies",  "views": 87},
@@ -133,7 +218,6 @@ SEED_POPULAR_QUESTIONS = [
     {"question": "How do I contact HR?",                     "category": "general",   "views": 43},
     {"question": "What is the remote work policy?",          "category": "policies",  "views": 38},
 ]
-
 SEED_CATEGORIES = [
     {"id": "policies",  "name": "Company Policies",       "icon": "policy"},
     {"id": "benefits",  "name": "Benefits & Perks",        "icon": "card_giftcard"},
@@ -143,87 +227,29 @@ SEED_CATEGORIES = [
     {"id": "general",   "name": "General Inquiries",       "icon": "help"},
 ]
 
-SENSITIVE_KEYWORDS = ['salary', 'fire', 'terminate', 'lawsuit', 'harassment', 'discrimination']
-
-SYSTEM_PROMPT = """You are ResourcefulAI's HR Knowledge Assistant — a helpful, professional virtual assistant for employees.
-
-Answer the users HR-related query using ONLY the company information provided.
-If the question is outside your scope or information is missing, direct the user to HR at hr@company.com
-
-## YOUR ROLE & CAPABILITIES
-You help employees with:
-- Company policies and procedures
-- Working hours, schedules, and remote work policies
-- Benefits, perks, and compensation information
-- Leave policies (annual, sick, personal, maternity/paternity)
-- Dress code and workplace conduct
-- Office locations, facilities, and amenities
-- Onboarding, training, and career development
-- General HR inquiries and employee support
-
-## COMPANY INFORMATION
-**Company name:** ResourcefulAI
-**Working Hours:** Monday-Friday, 9 AM - 6 PM (SGT)
-**Dress Code:** Business casual (smart casual on Fridays)
-**Main Office:** 123 Business Street, Singapore 018956
-**HR Contact:** hr@company.com | +65 6123 4567
-**Leave Entitlements:**
-- Annual Leave: 18 days per year
-- Sick Leave: 14 days per year (medical certificate required for 2+ days)
-- Personal Leave: 3 days per year
-**Medical Benefits:** Full coverage for employees, 50% for dependents
-
-## RESPONSE GUIDELINES
-1. Be Professional & Friendly
-2. Be Concise (2-4 sentences for simple queries)
-3. Be Accurate — only use info from above
-4. If unsure, direct them to HR at hr@company.com
-5. Do NOT include any extra explanations outside the answer
-
-## GUARDRAILS — NEVER DO THESE:
-DO NOT provide medical, legal, or financial advice
-DO NOT discuss other employees' personal information or salaries
-DO NOT make promises on behalf of HR or management
-DO NOT handle harassment/discrimination complaints (escalate to HR)
-"""
-
 # ─────────────────────────────────────────────
 # Startup / Shutdown
 # ─────────────────────────────────────────────
 @app.on_event("startup")
 async def startup_event():
     global mongo_client, db
-
-    logger.info("=" * 50)
-    logger.info("🚀 FAQ Agent Starting Up")
-    logger.info("=" * 50)
-    logger.info(f"OpenAI API Key: {'✅ Configured' if OPENAI_API_KEY else '❌ Missing'}")
-    logger.info(f"MongoDB URL:    {MONGODB_URL}")
-
+    logger.info("🚀 FAQ Agent v2 Starting (with tool calling)")
     try:
         mongo_client = AsyncIOMotorClient(MONGODB_URL)
         db = mongo_client[DB_NAME]
         await mongo_client.admin.command("ping")
-        logger.info("✅ MongoDB connected successfully")
-
+        logger.info("✅ MongoDB connected")
         if await db.popular_questions.count_documents({}) == 0:
-            await db.popular_questions.insert_many(SEED_POPULAR_QUESTIONS)
-            logger.info(f"🌱 Seeded {len(SEED_POPULAR_QUESTIONS)} popular questions")
-
+            await db.popular_questions.insert_many(SEED_POPULAR)
         if await db.categories.count_documents({}) == 0:
             await db.categories.insert_many(SEED_CATEGORIES)
-            logger.info(f"🌱 Seeded {len(SEED_CATEGORIES)} FAQ categories")
-
     except Exception as e:
-        logger.error(f"❌ MongoDB connection failed: {str(e)}")
-
-    logger.info("=" * 50)
+        logger.error(f"❌ MongoDB failed: {str(e)}")
 
 @app.on_event("shutdown")
 async def shutdown_event():
     if mongo_client:
         mongo_client.close()
-        logger.info("🔌 MongoDB connection closed")
 
 # ─────────────────────────────────────────────
 # Health Check
@@ -237,183 +263,140 @@ async def health_check():
             mongo_status = "connected"
     except Exception:
         mongo_status = "error"
-
-    return {
-        "status": "healthy",
-        "service": "faq-agent",
-        "version": "1.0.0",
-        "openai_api_key": "configured" if OPENAI_API_KEY else "missing",
-        "openai_client": "initialized" if client else "failed",
-        "mongodb_status": mongo_status
-    }
+    return {"status": "healthy", "service": "faq-agent", "version": "2.0.0",
+            "openai_status": "configured" if OPENAI_API_KEY else "missing",
+            "mongodb_status": mongo_status, "mode": "agentic-tool-calling"}
 
 # ─────────────────────────────────────────────
-# AI Ask Endpoint — Level 1 Conversational Memory
+# AI Ask Endpoint — Agentic Loop
 # ─────────────────────────────────────────────
 @app.post("/api/faq/ask", response_model=QuestionResponse)
 async def ask_question(request: QuestionRequest):
     try:
-        logger.info(f"📥 Received question: {request.question}")
+        logger.info(f"📥 FAQ question: {request.question}")
+        if not OPENAI_API_KEY or not client:
+            raise HTTPException(status_code=500, detail="OpenAI not configured")
 
-        if not OPENAI_API_KEY:
-            raise HTTPException(status_code=500, detail="OpenAI API key not configured")
-        if not client:
-            raise HTTPException(status_code=500, detail="OpenAI client initialization failed")
-
-        # Use provided conversation_id or generate a new one
         conv_id = request.conversation_id or str(uuid.uuid4())
 
-        # ── Strip coordinator-appended context before guardrail check ─────────
-        # The coordinator enriches queries with prior conversation history by
-        # appending a [Prior conversation context: ...] block. That block may
-        # contain sensitive words (e.g. "salary" from a previous payroll turn)
-        # that would incorrectly trigger the guardrail on an innocent question.
-        # We extract only the original user question — the text before the marker.
-        CONTEXT_MARKER = "[Prior conversation context:"
+        # ── Strip coordinator context before guardrail check ──────────────────
         original_question = request.question
         if CONTEXT_MARKER in request.question:
             original_question = request.question.split(CONTEXT_MARKER)[0].strip()
 
-        # ── Sensitive keyword check — only on the original question ──────────
+        # ── Guardrail check (original question only) ──────────────────────────
         if any(kw in original_question.lower() for kw in SENSITIVE_KEYWORDS):
-            logger.warning(f"Sensitive query detected: {original_question}")
-            sensitive_answer = (
+            logger.warning(f"🚨 Sensitive FAQ query: {original_question}")
+            escalation_answer = (
                 "This seems like a sensitive matter that requires direct HR support. "
                 "Please contact hr@company.com or call +65 6123 4567."
             )
-            # Log it (flagged=True for HR audit trail)
             await log_message(conv_id, "user",      request.question,  request.user_id, flagged=True)
-            await log_message(conv_id, "assistant", sensitive_answer,  request.user_id, flagged=True)
+            await log_message(conv_id, "assistant", escalation_answer, request.user_id, flagged=True)
+            return QuestionResponse(answer=escalation_answer, question=request.question,
+                                    confidence=1.0, conversation_id=conv_id, tools_used=["escalate_to_hr"])
 
-            return QuestionResponse(
-                answer=sensitive_answer,
-                question=request.question,
-                confidence=1.0,
-                conversation_id=conv_id
-            )
-
-        # ── Start messages with system prompt ──
+        # ── Build messages with history ───────────────────────────────────────
         messages = [{"role": "system", "content": SYSTEM_PROMPT}]
-
-        # ── Inject conversation history for Level 1 memory ──
-        history = await get_conversation_history(conv_id, limit=10)
+        history  = await get_conversation_history(conv_id, limit=10)
         for msg in history:
             messages.append({"role": msg["role"], "content": msg["message"]})
-
-        logger.info(f"💬 Injecting {len(history)} previous messages into context")
-
-        # ── Append current user message ──
         messages.append({"role": "user", "content": request.question})
 
-        # ── Call OpenAI ──
-        logger.info("🔄 Calling OpenAI API...")
-        response = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=messages,
-            temperature=0.7,
-            max_tokens=500
-        )
+        # ── Agentic loop ──────────────────────────────────────────────────────
+        tools_used = []
+        max_iterations = 5
 
-        answer = response.choices[0].message.content.strip()
-        logger.info(f"✅ Got response from OpenAI: {answer[:100]}...")
+        for iteration in range(max_iterations):
+            logger.info(f"🔄 FAQ agent iteration {iteration + 1}")
+            response = client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=messages,
+                tools=FAQ_TOOLS,
+                tool_choice="auto",
+                temperature=0.3,
+                max_tokens=600
+            )
 
-        # ── Persist both sides of the exchange ──
+            msg = response.choices[0].message
+            messages.append(msg)
+
+            # If no tool calls, we have the final answer
+            if not msg.tool_calls:
+                answer = msg.content.strip() if msg.content else "I was unable to generate a response."
+                logger.info(f"✅ FAQ agent finished after {iteration + 1} iteration(s), tools used: {tools_used}")
+
+                await log_message(conv_id, "user",      request.question, request.user_id)
+                await log_message(conv_id, "assistant", answer,           request.user_id)
+
+                return QuestionResponse(
+                    answer=answer, question=request.question,
+                    confidence=0.95, conversation_id=conv_id, tools_used=tools_used
+                )
+
+            # Execute all tool calls in this round
+            for tool_call in msg.tool_calls:
+                tool_name = tool_call.function.name
+                tool_args = json.loads(tool_call.function.arguments)
+                logger.info(f"🔧 FAQ agent calling tool: {tool_name}({tool_args})")
+
+                tool_result = await execute_tool(tool_name, tool_args, request.user_id)
+                tools_used.append(tool_name)
+
+                messages.append({
+                    "role":         "tool",
+                    "tool_call_id": tool_call.id,
+                    "content":      tool_result
+                })
+
+        # Fallback if max iterations reached
+        answer = "I reached the maximum reasoning steps. Please try rephrasing your question or contact HR directly."
         await log_message(conv_id, "user",      request.question, request.user_id)
         await log_message(conv_id, "assistant", answer,           request.user_id)
-
-        return QuestionResponse(
-            answer=answer,
-            question=request.question,
-            confidence=0.95,
-            conversation_id=conv_id
-        )
+        return QuestionResponse(answer=answer, question=request.question,
+                                confidence=0.5, conversation_id=conv_id, tools_used=tools_used)
 
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"❌ Error processing question: {str(e)}")
-        logger.error(f"Traceback: {traceback.format_exc()}")
-
-        error_message = str(e)
-        if "invalid_api_key" in error_message or "Incorrect API key" in error_message:
-            detail = "Invalid OpenAI API key. Please check your API key in .env file"
-        elif "insufficient_quota" in error_message:
-            detail = "OpenAI API quota exceeded. Please check your OpenAI account billing"
-        elif "rate_limit" in error_message:
-            detail = "OpenAI API rate limit exceeded. Please try again in a moment"
-        else:
-            detail = f"Error: {error_message}"
-
-        raise HTTPException(status_code=500, detail=detail)
+        logger.error(f"❌ FAQ error: {traceback.format_exc()}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 # ─────────────────────────────────────────────
-# Categories & Popular Questions (from MongoDB)
+# Supporting Endpoints
 # ─────────────────────────────────────────────
 @app.get("/api/faq/categories")
 async def get_categories():
-    try:
-        if db is None:
-            raise HTTPException(status_code=500, detail="Database not connected")
-
-        cursor = db.categories.find({}, {"_id": 0})
-        categories = await cursor.to_list(length=50)
-        return {"categories": categories}
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    if db is None:
+        raise HTTPException(status_code=500, detail="Database not connected")
+    cursor = db.categories.find({}, {"_id": 0})
+    return {"categories": await cursor.to_list(length=50)}
 
 @app.get("/api/faq/popular")
 async def get_popular_questions():
-    try:
-        if db is None:
-            raise HTTPException(status_code=500, detail="Database not connected")
-
-        cursor = db.popular_questions.find(
-            {}, {"_id": 0, "question": 1}
-        ).sort("views", -1).limit(10)
-
-        docs = await cursor.to_list(length=10)
-        return {"questions": [d["question"] for d in docs]}
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-# ─────────────────────────────────────────────
-# Chat History Endpoints
-# ─────────────────────────────────────────────
-@app.get("/api/faq/history/chat")
-async def get_chat_history(user_id: str, limit: int = 50):
-    """All recent chat messages for a user."""
     if db is None:
         raise HTTPException(status_code=500, detail="Database not connected")
+    cursor = db.popular_questions.find({}, {"_id": 0, "question": 1}).sort("views", -1).limit(10)
+    docs = await cursor.to_list(length=10)
+    return {"questions": [d["question"] for d in docs]}
 
+@app.get("/api/faq/history/chat")
+async def get_chat_history(user_id: str, limit: int = 50):
+    if db is None:
+        raise HTTPException(status_code=500, detail="Database not connected")
     cursor = db.chat_history.find(
-        {"user_id": user_id, "service": "faq"},
-        sort=[("timestamp", -1)]
+        {"user_id": user_id, "service": "faq"}, sort=[("timestamp", -1)]
     ).limit(limit)
-
     history = await cursor.to_list(length=limit)
     return {"user_id": user_id, "history": [serialize_doc(h) for h in history]}
 
 @app.get("/api/faq/history/chat/{conversation_id}")
 async def get_conversation(conversation_id: str):
-    """All messages in a specific conversation thread, in chronological order."""
     if db is None:
         raise HTTPException(status_code=500, detail="Database not connected")
-
-    cursor = db.chat_history.find(
-        {"conversation_id": conversation_id},
-        sort=[("timestamp", 1)]
-    )
-
+    cursor = db.chat_history.find({"conversation_id": conversation_id}, sort=[("timestamp", 1)])
     messages = await cursor.to_list(length=200)
     return {"conversation_id": conversation_id, "messages": [serialize_doc(m) for m in messages]}
 
-
 if __name__ == "__main__":
-    port = int(os.getenv("PORT", 8002))
-    uvicorn.run(app, host="0.0.0.0", port=port)
+    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 8002)))

@@ -1,91 +1,52 @@
 """
-Coordinator Agent - Intelligent Multi-Agent Router
-Routes user queries to the appropriate specialised HR agent.
-
-Brain features:
-- Level 1: MongoDB chat_history — last N messages injected into routing
-            prompt so follow-up queries route correctly across turns
-- Level 2: Redis session state — per-employee context (last_service,
-            last_topic, services_used) with 1-hour TTL for fast reads
-- Guardrails: sensitive keyword interception before routing
-- Audit logging: all exchanges persisted with agent_used and flagged fields
+Coordinator Agent - Multi-Step Plan-and-Execute Orchestrator
+Upgraded to true multi-step: plans a sequence of agent calls,
+executes each step, passes results as context to the next,
+then synthesises a unified final answer.
 """
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional, Dict, List, Any
-import os
+import os, json, uuid, traceback
 from dotenv import load_dotenv
 import logging
 from openai import OpenAI
 import httpx
 from datetime import datetime
-import json
-import uuid
 import uvicorn
 from motor.motor_asyncio import AsyncIOMotorClient
 from bson import ObjectId
 import redis.asyncio as aioredis
 
 load_dotenv()
-
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-app = FastAPI(
-    title="Coordinator Agent",
-    description="Intelligent Multi-Agent Router with Brain (MongoDB + Redis)",
-    version="2.0.0"
-)
+app = FastAPI(title="Coordinator Agent",
+              description="Multi-Step Plan-and-Execute Orchestrator", version="3.0.0")
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True,
+                   allow_methods=["*"], allow_headers=["*"])
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# ─────────────────────────────────────────────
-# OpenAI Setup
-# ─────────────────────────────────────────────
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-if not OPENAI_API_KEY:
-    logger.error("❌ OPENAI_API_KEY not found!")
-else:
-    logger.info("✅ OpenAI API Key configured")
+openai_client  = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 
-openai_client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
-
-# ─────────────────────────────────────────────
-# Agent URLs
-# ─────────────────────────────────────────────
 FAQ_URL         = os.getenv("FAQ_SERVICE_URL",         "http://localhost:8002")
 PAYROLL_URL     = os.getenv("PAYROLL_SERVICE_URL",     "http://localhost:8003")
 LEAVE_URL       = os.getenv("LEAVE_SERVICE_URL",       "http://localhost:8004")
 RECRUITMENT_URL = os.getenv("RECRUITMENT_SERVICE_URL", "http://localhost:8005")
 PERFORMANCE_URL = os.getenv("PERFORMANCE_SERVICE_URL", "http://localhost:8006")
 
-# ─────────────────────────────────────────────
-# MongoDB Setup
-# ─────────────────────────────────────────────
 MONGODB_URL = os.getenv("DATABASE_URL", "mongodb://localhost:27017")
 DB_NAME     = os.getenv("DB_NAME", "coordinator_db")
-
-mongo_client: AsyncIOMotorClient = None
-db = None
-
-# ─────────────────────────────────────────────
-# Redis Setup (Level 2 session state)
-# ─────────────────────────────────────────────
 REDIS_URL   = os.getenv("REDIS_URL", "redis://localhost:6379")
-SESSION_TTL = 3600   # 1 hour TTL — session auto-expires after inactivity
+SESSION_TTL = 3600
 
-redis_client = None
+mongo_client  = None
+db            = None
+redis_client  = None
+http_client   = httpx.AsyncClient(timeout=30.0)
 
 # ─────────────────────────────────────────────
 # Pydantic Models
@@ -93,396 +54,346 @@ redis_client = None
 class CoordinatorRequest(BaseModel):
     query: str
     employee_id: Optional[str] = None
-    conversation_id: Optional[str] = None      # ← thread identifier
+    conversation_id: Optional[str] = None
     context: Optional[Dict[str, Any]] = None
 
 class CoordinatorResponse(BaseModel):
     answer: str
     agent_used: str
     confidence: float
-    conversation_id: str                        # ← returned so frontend can reuse it
+    conversation_id: str
+    plan_executed: List[str] = []     # which agents were called in order
+    tools_used: List[str] = []        # all tools fired across all agents
     metadata: Optional[Dict] = None
 
 # ─────────────────────────────────────────────
 # Guardrails
 # ─────────────────────────────────────────────
 COORDINATOR_SENSITIVE_KEYWORDS = [
-    "ignore instructions",    # jailbreak attempt
-    "override",               # prompt injection
-    "forget everything",      # context wiping attempt
-    "pretend you are",        # persona override
-    "act as",                 # persona override
-    "bypass",                 # security bypass attempt
-    "jailbreak",              # explicit jailbreak
-    "do anything now",        # DAN-style jailbreak
-    "you are now",            # persona override
+    "ignore instructions", "forget everything", "pretend you are",
+    "act as", "bypass", "jailbreak", "do anything now", "you are now",
 ]
-
 COORDINATOR_ESCALATION_RESPONSE = (
     "I'm unable to process that request. If you have a genuine HR query, "
-    "please rephrase your question or contact hr@company.com directly."
+    "please rephrase or contact hr@company.com directly."
 )
 
 # ─────────────────────────────────────────────
 # Helpers — MongoDB chat history (Level 1)
 # ─────────────────────────────────────────────
-async def log_message(
-    conv_id: str,
-    role: str,
-    message: str,
-    employee_id: str = None,
-    agent_used: str = None,
-    flagged: bool = False
-):
-    """Persist a coordinator chat message. Never raises."""
+async def log_message(conv_id, role, message, employee_id=None,
+                       agent_used=None, flagged=False):
     if db is None:
         return
     try:
         await db.chat_history.insert_one({
-            "conversation_id": conv_id,
-            "service":         "coordinator",
-            "employee_id":     employee_id,
-            "role":            role,
-            "message":         message,
-            "agent_used":      agent_used,   # which downstream agent handled this turn
-            "flagged":         flagged,
-            "timestamp":       datetime.now().isoformat()
+            "conversation_id": conv_id, "service": "coordinator",
+            "employee_id": employee_id, "role": role,
+            "message": message, "agent_used": agent_used,
+            "flagged": flagged, "timestamp": datetime.now().isoformat()
         })
     except Exception as e:
-        logger.warning(f"⚠️ Failed to log message: {str(e)}")
+        logger.warning(f"⚠️ log_message failed: {str(e)}")
 
-async def get_conversation_history(conv_id: str, limit: int = 10) -> List[Dict]:
-    """
-    Fetch last N messages for a conversation, oldest-first.
-    Includes agent_used so the routing prompt knows which services
-    have already handled turns in this conversation.
-    """
+async def get_conversation_history(conv_id, limit=10):
     if db is None:
         return []
     try:
-        cursor = db.chat_history.find(
-            {"conversation_id": conv_id},
-            sort=[("timestamp", 1)]
-        ).limit(limit)
+        cursor = db.chat_history.find({"conversation_id": conv_id}, sort=[("timestamp", 1)]).limit(limit)
         return await cursor.to_list(length=limit)
     except Exception as e:
-        logger.warning(f"⚠️ Failed to fetch history: {str(e)}")
+        logger.warning(f"⚠️ get_history failed: {str(e)}")
         return []
 
 # ─────────────────────────────────────────────
 # Helpers — Redis session state (Level 2)
-#
-# Stores per-employee context in Redis with a
-# native TTL so stale sessions auto-expire.
-# Falls back to empty dict if Redis is down —
-# the service degrades gracefully.
 # ─────────────────────────────────────────────
-async def get_session(employee_id: str) -> Dict:
-    """
-    Retrieve per-employee session context from Redis.
-    Returns empty dict if no session exists or Redis is unavailable.
-    """
+async def get_session(employee_id):
     if redis_client is None:
         return {}
     try:
         data = await redis_client.get(f"session:{employee_id}")
         return json.loads(data) if data else {}
     except Exception as e:
-        logger.warning(f"⚠️ Failed to get session: {str(e)}")
+        logger.warning(f"⚠️ Redis get failed: {str(e)}")
         return {}
 
-async def save_session(employee_id: str, updates: Dict):
-    """
-    Merge updates into the employee session and reset the TTL.
-    Stored as a JSON string at key session:{employee_id}.
-
-    Session schema:
-      last_service:  last agent used (e.g. "payroll")
-      last_topic:    truncated last query (100 chars)
-      last_active:   ISO timestamp
-      services_used: cumulative list of agents used this session
-    """
+async def save_session(employee_id, updates):
     if redis_client is None:
         return
     try:
         existing = await get_session(employee_id)
         existing.update(updates)
         existing["last_active"] = datetime.now().isoformat()
-
-        # Track running list of services used this session
         services_used = existing.get("services_used", [])
         new_service   = updates.get("last_service")
         if new_service and new_service not in services_used:
             services_used.append(new_service)
         existing["services_used"] = services_used
-
-        # setex writes the value and sets the TTL in one atomic operation
-        await redis_client.setex(
-            f"session:{employee_id}",
-            SESSION_TTL,
-            json.dumps(existing)
-        )
+        await redis_client.setex(f"session:{employee_id}", SESSION_TTL, json.dumps(existing))
     except Exception as e:
-        logger.warning(f"⚠️ Failed to save session: {str(e)}")
+        logger.warning(f"⚠️ Redis save failed: {str(e)}")
 
 # ─────────────────────────────────────────────
 # Agent Callers
 # ─────────────────────────────────────────────
-http_client = httpx.AsyncClient(timeout=30.0)
-
 async def call_faq_agent(query: str, conv_id: str) -> Dict:
     try:
-        logger.info("🔀 Routing to FAQ Agent")
-        response = await http_client.post(
-            f"{FAQ_URL}/api/faq/ask",
-            json={"question": query, "conversation_id": conv_id}
-        )
-        response.raise_for_status()
-        data = response.json()
-        return {"answer": data.get("answer", ""), "agent": "FAQ", "success": True}
+        resp = await http_client.post(f"{FAQ_URL}/api/faq/ask",
+                                      json={"question": query, "conversation_id": conv_id})
+        resp.raise_for_status()
+        data = resp.json()
+        return {"answer": data.get("answer", ""), "agent": "FAQ",
+                "tools_used": data.get("tools_used", []), "success": True}
     except Exception as e:
-        logger.error(f"❌ FAQ Agent error: {str(e)}")
-        return {"answer": f"FAQ service unavailable: {str(e)}", "agent": "FAQ", "success": False}
+        logger.error(f"❌ FAQ Agent: {str(e)}")
+        return {"answer": f"FAQ unavailable: {str(e)}", "agent": "FAQ", "tools_used": [], "success": False}
 
 async def call_payroll_agent(query: str, employee_id: str, conv_id: str) -> Dict:
     try:
-        logger.info("🔀 Routing to Payroll Agent")
-        response = await http_client.post(
-            f"{PAYROLL_URL}/api/payroll/query",
-            json={"query": query, "employee_id": employee_id, "conversation_id": conv_id}
-        )
-        response.raise_for_status()
-        data = response.json()
-        return {"answer": data.get("answer", ""), "agent": "Payroll", "success": True}
+        resp = await http_client.post(f"{PAYROLL_URL}/api/payroll/query",
+                                      json={"query": query, "employee_id": employee_id, "conversation_id": conv_id})
+        resp.raise_for_status()
+        data = resp.json()
+        return {"answer": data.get("answer", ""), "agent": "Payroll",
+                "tools_used": data.get("tools_used", []), "success": True}
     except Exception as e:
-        logger.error(f"❌ Payroll Agent error: {str(e)}")
-        return {"answer": f"Payroll service unavailable: {str(e)}", "agent": "Payroll", "success": False}
+        logger.error(f"❌ Payroll Agent: {str(e)}")
+        return {"answer": f"Payroll unavailable: {str(e)}", "agent": "Payroll", "tools_used": [], "success": False}
 
 async def call_leave_agent(query: str, employee_id: str, conv_id: str) -> Dict:
     try:
-        logger.info("🔀 Routing to Leave Agent")
-        response = await http_client.post(
-            f"{LEAVE_URL}/api/leave/query",
-            json={"query": query, "employee_id": employee_id, "conversation_id": conv_id}
-        )
-        response.raise_for_status()
-        data = response.json()
-        return {"answer": data.get("answer", ""), "agent": "Leave", "success": True}
+        resp = await http_client.post(f"{LEAVE_URL}/api/leave/query",
+                                      json={"query": query, "employee_id": employee_id, "conversation_id": conv_id})
+        resp.raise_for_status()
+        data = resp.json()
+        return {"answer": data.get("answer", ""), "agent": "Leave",
+                "tools_used": data.get("tools_used", []), "success": True}
     except Exception as e:
-        logger.error(f"❌ Leave Agent error: {str(e)}")
-        return {"answer": f"Leave service unavailable: {str(e)}", "agent": "Leave", "success": False}
+        logger.error(f"❌ Leave Agent: {str(e)}")
+        return {"answer": f"Leave unavailable: {str(e)}", "agent": "Leave", "tools_used": [], "success": False}
 
 async def call_recruitment_agent(query: str, conv_id: str) -> Dict:
     try:
-        logger.info("🔀 Routing to Recruitment Agent")
-        response = await http_client.post(
-            f"{RECRUITMENT_URL}/api/recruitment/query",
-            json={"query": query, "conversation_id": conv_id}
-        )
-        response.raise_for_status()
-        data = response.json()
-        return {"answer": data.get("answer", ""), "agent": "Recruitment", "success": True}
+        resp = await http_client.post(f"{RECRUITMENT_URL}/api/recruitment/query",
+                                      json={"query": query, "conversation_id": conv_id})
+        resp.raise_for_status()
+        data = resp.json()
+        return {"answer": data.get("answer", ""), "agent": "Recruitment",
+                "tools_used": data.get("tools_used", []), "success": True}
     except Exception as e:
-        logger.error(f"❌ Recruitment Agent error: {str(e)}")
-        return {"answer": f"Recruitment service unavailable: {str(e)}", "agent": "Recruitment", "success": False}
+        logger.error(f"❌ Recruitment Agent: {str(e)}")
+        return {"answer": f"Recruitment unavailable: {str(e)}", "agent": "Recruitment", "tools_used": [], "success": False}
 
 async def call_performance_agent(query: str, employee_id: str, conv_id: str) -> Dict:
     try:
-        logger.info("🔀 Routing to Performance Agent")
-        response = await http_client.post(
-            f"{PERFORMANCE_URL}/api/performance/query",
-            json={"query": query, "employee_id": employee_id, "conversation_id": conv_id}
-        )
-        response.raise_for_status()
-        data = response.json()
-        return {"answer": data.get("answer", ""), "agent": "Performance", "success": True}
+        resp = await http_client.post(f"{PERFORMANCE_URL}/api/performance/query",
+                                      json={"query": query, "employee_id": employee_id, "conversation_id": conv_id})
+        resp.raise_for_status()
+        data = resp.json()
+        return {"answer": data.get("answer", ""), "agent": "Performance",
+                "tools_used": data.get("tools_used", []), "success": True}
     except Exception as e:
-        logger.error(f"❌ Performance Agent error: {str(e)}")
-        return {"answer": f"Performance service unavailable: {str(e)}", "agent": "Performance", "success": False}
+        logger.error(f"❌ Performance Agent: {str(e)}")
+        return {"answer": f"Performance unavailable: {str(e)}", "agent": "Performance", "tools_used": [], "success": False}
+
+AGENT_DISPATCH = {
+    "FAQ":         lambda q, eid, cid: call_faq_agent(q, cid),
+    "Payroll":     lambda q, eid, cid: call_payroll_agent(q, eid, cid),
+    "Leave":       lambda q, eid, cid: call_leave_agent(q, eid, cid),
+    "Recruitment": lambda q, eid, cid: call_recruitment_agent(q, cid),
+    "Performance": lambda q, eid, cid: call_performance_agent(q, eid, cid),
+}
+
+# ─────────────────────────────────────────────
+# Meta-Query Detection and Handler
+# ─────────────────────────────────────────────
+META_KEYWORDS = [
+    "first question", "last question", "previous question",
+    "what did i ask", "what have we", "our conversation",
+    "earlier question", "summarise", "summarize", "recap",
+    "what we talked", "what i asked", "go back to",
+    "previous message", "earlier message", "what was my",
+]
 
 async def is_meta_query(query: str) -> bool:
-    """
-    Detect whether the user is asking about the conversation itself
-    rather than an HR topic. These are answered directly by the
-    coordinator using its own chat_history — never routed downstream.
+    return any(kw in query.lower() for kw in META_KEYWORDS)
 
-    Examples:
-      "what was my first question?"
-      "what have we talked about?"
-      "can you summarise our conversation?"
-      "what did I ask earlier?"
-    """
-    meta_keywords = [
-        "first question", "last question", "previous question",
-        "what did i ask", "what have we", "what have i",
-        "our conversation", "earlier question", "summarise",
-        "summarize", "recap", "what we talked", "what i asked",
-        "history", "remember what", "you remember", "go back to",
-        "what was my", "previous message", "earlier message",
-    ]
-    query_lower = query.lower()
-    return any(kw in query_lower for kw in meta_keywords)
-
-
-async def handle_meta_query(query: str, history: List[Dict], employee_id: str) -> str:
-    """
-    Answer conversation-about-conversation questions directly using
-    the coordinator's own chat_history — the only place that holds
-    the full cross-service conversation record.
-    """
+async def handle_meta_query(query: str, history: List[Dict]) -> str:
     if not history:
-        return (
-            "I don't have any previous messages in this conversation yet. "
-            "Feel free to ask me anything about HR!"
-        )
+        return "I don't have any previous messages in this conversation yet. Feel free to ask anything about HR!"
 
-    # Build a full readable transcript from coordinator history
-    transcript_lines = []
-    for i, msg in enumerate(history):
-        role  = "You" if msg["role"] == "user" else "Assistant"
-        agent = f" ({msg['agent_used']} Agent)" if msg.get("agent_used") else ""
-        text  = msg["message"]
-        transcript_lines.append(f"{i + 1}. {role}{agent}: {text}")
-
-    transcript = "\n".join(transcript_lines)
-
-    # Let OpenAI answer the meta question using the real transcript
-    meta_prompt = f"""You are an HR assistant with access to the full conversation history below.
-Answer the user's question about the conversation accurately using only this transcript.
-
-Conversation transcript:
-{transcript}
-
-User question: {query}
-
-Answer concisely and accurately based strictly on the transcript above."""
-
+    transcript = "\n".join([
+        f"{i+1}. {'You' if m['role']=='user' else 'Assistant'}"
+        f"{' ('+m['agent_used']+' Agent)' if m.get('agent_used') else ''}: {m['message']}"
+        for i, m in enumerate(history)
+    ])
+    prompt = (f"Answer this question about the conversation using only the transcript:\n\n"
+              f"Transcript:\n{transcript}\n\nQuestion: {query}")
     try:
-        response = openai_client.chat.completions.create(
+        resp   = openai_client.chat.completions.create(
             model="gpt-4o-mini",
-            messages=[{"role": "user", "content": meta_prompt}],
-            temperature=0.1,
-            max_tokens=300
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.1, max_tokens=300
         )
-        return response.choices[0].message.content.strip()
+        return resp.choices[0].message.content.strip()
     except Exception as e:
-        logger.error(f"❌ Meta query OpenAI call failed: {str(e)}")
-        # Graceful fallback — return first user message manually
         first_user = next((m for m in history if m["role"] == "user"), None)
         if first_user:
             return f"Your first question was: \"{first_user['message']}\""
-        return "I wasn't able to retrieve the conversation history right now."
-
+        return "I couldn't retrieve the conversation history right now."
 
 # ─────────────────────────────────────────────
-# Intelligent Routing — Context-Aware
+# PLANNER — creates a step-by-step plan
 # ─────────────────────────────────────────────
-async def route_query_intelligent(
-    query: str,
-    employee_id: str,
-    conv_id: str,
-    session: Dict,
-    history: List[Dict]
-) -> Dict:
+async def create_plan(query: str, session: Dict, history: List[Dict]) -> List[str]:
     """
-    Routes a query to the appropriate agent using GPT-4o-mini.
-
-    Two layers of context enrichment:
-      1. Routing prompt: enriched with session + history so routing
-         decisions are correct for follow-up queries
-      2. Enriched query: history summary appended to the query text
-         sent downstream so each agent has cross-service context
-         even though it only stores its own portion of history
+    Ask GPT to decompose the query into an ordered list of agent calls.
+    Returns a list like ["Performance", "Payroll"] for multi-step queries,
+    or ["FAQ"] for simple single-agent queries.
     """
-    if not OPENAI_API_KEY:
-        logger.warning("⚠️ No OpenAI key — defaulting to FAQ agent")
-        return await call_faq_agent(query, conv_id)
+    session_hint  = ""
+    if session.get("last_service") and session.get("last_topic"):
+        session_hint = (f"\nSession context: Employee recently asked about "
+                        f"'{session['last_topic']}' via {session['last_service']} agent.")
 
-    try:
-        # ── Session context hint ─────────────────────────────────────────────
-        session_hint = ""
-        if session.get("last_service") and session.get("last_topic"):
-            session_hint = (
-                f"\nSession context: This employee was recently asking about "
-                f"'{session['last_topic']}' via the {session['last_service']} agent."
-            )
-        if session.get("services_used"):
-            session_hint += (
-                f"\nServices used this session: {', '.join(session['services_used'])}."
-            )
+    history_hint = ""
+    if history:
+        lines = [f"  {m['role']}"
+                 f"{' ['+m['agent_used']+']' if m.get('agent_used') else ''}: "
+                 f"{m['message'][:100]}" for m in history[-6:]]
+        history_hint = "\nRecent conversation:\n" + "\n".join(lines)
 
-        # ── Conversation history for routing context ─────────────────────────
-        history_hint = ""
-        if history:
-            recent = history[-6:]
-            lines  = []
-            for msg in recent:
-                role  = msg["role"]
-                text  = msg["message"][:120]
-                agent = f" [{msg['agent_used']}]" if msg.get("agent_used") else ""
-                lines.append(f"  {role}{agent}: {text}")
-            history_hint = "\nRecent conversation:\n" + "\n".join(lines)
+    planning_prompt = f"""You are an intelligent planner for an HR system.
+Analyse the user query and create an execution plan — an ordered list of agents to call.
 
-        # ── Routing prompt ───────────────────────────────────────────────────
-        routing_prompt = f"""You are an intelligent router for an HR system with 5 specialised agents.
-Analyse the user query and determine which agent should handle it.
+Rules:
+- Simple queries needing ONE agent: return a single-item list, e.g. ["FAQ"]
+- Complex queries needing MULTIPLE agents: return them in order, e.g. ["Performance", "Payroll"]
+- Later steps get the output of earlier steps as context
+- Maximum 3 agents per plan
 {session_hint}
 {history_hint}
 
-Available Agents:
-1. FAQ         — General HR questions, company policies, working hours, dress code, benefits overview
-2. Payroll     — Salary, payslips, bonuses, deductions, CPF, tax, compensation
-3. Leave       — Leave balance, leave requests, vacation days, sick leave, time off
-4. Recruitment — Job openings, interview process, hiring timeline, career opportunities
-5. Performance — Goals, KPIs, performance reviews, career development, feedback
+Available agents:
+- FAQ: general HR questions, policies, benefits, office info
+- Payroll: salary, payslips, deductions, CPF, tax
+- Leave: leave balance, requests, approvals
+- Recruitment: job openings, hiring process
+- Performance: goals, KPIs, performance reviews
 
-Respond with ONLY ONE word: FAQ, Payroll, Leave, Recruitment, or Performance
+Example multi-step queries and their plans:
+- "Show my performance review and what bonus I might get" → ["Performance", "Payroll"]
+- "How much leave do I have and what is the process to apply?" → ["Leave", "FAQ"]
+- "What jobs are open and what is the salary for the data scientist role?" → ["Recruitment"]
+- "What are my goals and when is my next review?" → ["Performance"]
 
-User Query: "{query}"
-"""
+User query: "{query}"
 
-        response = openai_client.chat.completions.create(
+Respond with ONLY a valid JSON array of agent names, e.g. ["Performance", "Payroll"]
+No explanation, no markdown, just the JSON array."""
+
+    try:
+        resp       = openai_client.chat.completions.create(
             model="gpt-4o-mini",
-            messages=[{"role": "user", "content": routing_prompt}],
-            temperature=0.0,
-            max_tokens=10
+            messages=[{"role": "user", "content": planning_prompt}],
+            temperature=0.0, max_tokens=50
         )
-
-        agent_choice = response.choices[0].message.content.strip()
-        logger.info(f"🎯 Routing decision: {agent_choice}")
-
-        # ── Build history-enriched query for downstream agents ───────────────
-        # Downstream agents only have their own portion of chat_history.
-        # Appending a coordinator-level summary gives them the full picture,
-        # enabling correct follow-up answers across service boundaries.
-        enriched_query = query
-        if history:
-            summary_lines = []
-            for msg in history[-6:]:
-                role  = "User" if msg["role"] == "user" else "Assistant"
-                agent = f" [{msg['agent_used']}]" if msg.get("agent_used") else ""
-                summary_lines.append(f"{role}{agent}: {msg['message'][:150]}")
-            history_summary = "\n".join(summary_lines)
-            enriched_query = (
-                f"{query}\n\n"
-                f"[Prior conversation context for reference:\n{history_summary}]"
-            )
-
-        # ── Dispatch to chosen agent using enriched query ────────────────────
-        if "Payroll" in agent_choice:
-            return await call_payroll_agent(enriched_query, employee_id, conv_id)
-        elif "Leave" in agent_choice:
-            return await call_leave_agent(enriched_query, employee_id, conv_id)
-        elif "Recruitment" in agent_choice:
-            return await call_recruitment_agent(enriched_query, conv_id)
-        elif "Performance" in agent_choice:
-            return await call_performance_agent(enriched_query, employee_id, conv_id)
-        else:
-            return await call_faq_agent(enriched_query, conv_id)
-
+        raw   = resp.choices[0].message.content.strip()
+        plan  = json.loads(raw)
+        valid = [a for a in plan if a in AGENT_DISPATCH]
+        if not valid:
+            logger.warning(f"⚠️ Plan contained no valid agents: {raw}")
+            return ["FAQ"]
+        logger.info(f"📋 Plan created: {valid}")
+        return valid
     except Exception as e:
-        logger.error(f"❌ Routing error: {str(e)} — falling back to FAQ")
-        return await call_faq_agent(query, conv_id)
+        logger.error(f"❌ Planner failed: {str(e)} — defaulting to FAQ")
+        return ["FAQ"]
+
+# ─────────────────────────────────────────────
+# EXECUTOR — runs the plan step by step
+# ─────────────────────────────────────────────
+async def execute_plan(
+    plan: List[str],
+    original_query: str,
+    employee_id: str,
+    conv_id: str
+) -> Dict:
+    """
+    Execute each agent in the plan sequentially.
+    Each step's answer is appended as context to the next step's query,
+    enabling true multi-step reasoning across domain boundaries.
+    """
+    step_results  = []
+    all_tools     = []
+    cumulative_context = ""
+
+    for i, agent_name in enumerate(plan):
+        logger.info(f"▶️  Step {i+1}/{len(plan)}: calling {agent_name} agent")
+
+        # Build enriched query — original query + context from all previous steps
+        if cumulative_context:
+            enriched_query = (
+                f"{original_query}\n\n"
+                f"[Context from previous steps:\n{cumulative_context}]"
+            )
+        else:
+            enriched_query = original_query
+
+        dispatch = AGENT_DISPATCH.get(agent_name)
+        if not dispatch:
+            logger.error(f"❌ Unknown agent in plan: {agent_name}")
+            continue
+
+        result = await dispatch(enriched_query, employee_id, conv_id)
+        step_results.append(result)
+        all_tools.extend(result.get("tools_used", []))
+
+        # Append this step's answer to cumulative context for next step
+        if result.get("answer"):
+            cumulative_context += f"\n{agent_name} Agent: {result['answer']}"
+
+        logger.info(f"✅ Step {i+1} complete — {agent_name}: {result['answer'][:80]}...")
+
+    return {"step_results": step_results, "all_tools": all_tools}
+
+# ─────────────────────────────────────────────
+# SYNTHESISER — combines multi-step results
+# ─────────────────────────────────────────────
+async def synthesise_results(original_query: str, step_results: List[Dict]) -> str:
+    """
+    If only one step was executed, return its answer directly.
+    If multiple steps, ask GPT to synthesise a unified coherent response.
+    """
+    if len(step_results) == 1:
+        return step_results[0].get("answer", "I was unable to generate a response.")
+
+    results_text = "\n\n".join([
+        f"--- {r['agent']} Agent ---\n{r['answer']}"
+        for r in step_results if r.get("answer")
+    ])
+
+    synthesis_prompt = (
+        f"You are synthesising results from multiple HR specialist agents.\n"
+        f"Original question: {original_query}\n\n"
+        f"Specialist responses:\n{results_text}\n\n"
+        f"Provide a single, coherent, well-structured response that addresses all aspects "
+        f"of the original question using the specialist information above. "
+        f"Do not repeat agent labels — just give the unified answer."
+    )
+
+    try:
+        resp = openai_client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": synthesis_prompt}],
+            temperature=0.3, max_tokens=700
+        )
+        return resp.choices[0].message.content.strip()
+    except Exception as e:
+        logger.error(f"❌ Synthesis failed: {str(e)}")
+        # Fallback: concatenate answers
+        return "\n\n".join([f"**{r['agent']}:** {r['answer']}" for r in step_results])
 
 # ─────────────────────────────────────────────
 # Startup / Shutdown
@@ -490,181 +401,138 @@ User Query: "{query}"
 @app.on_event("startup")
 async def startup_event():
     global mongo_client, db, redis_client
-
-    logger.info("=" * 60)
-    logger.info("🚀 Coordinator Agent v2 Starting Up")
-    logger.info("=" * 60)
-    logger.info(f"OpenAI API:  {'✅ Configured' if OPENAI_API_KEY else '❌ Missing'}")
-    logger.info(f"MongoDB URL: {MONGODB_URL}")
-    logger.info(f"Redis URL:   {REDIS_URL}")
-
-    # ── MongoDB (Level 1 — chat history) ─────────────────────────────────────
+    logger.info("🚀 Coordinator Agent v3 Starting (Plan-and-Execute)")
+    logger.info(f"OpenAI: {'✅' if OPENAI_API_KEY else '❌'} | MongoDB: {MONGODB_URL} | Redis: {REDIS_URL}")
     try:
         mongo_client = AsyncIOMotorClient(MONGODB_URL)
         db = mongo_client[DB_NAME]
         await mongo_client.admin.command("ping")
         logger.info("✅ MongoDB connected")
     except Exception as e:
-        logger.error(f"❌ MongoDB connection failed: {str(e)}")
-
-    # ── Redis (Level 2 — session state) ──────────────────────────────────────
+        logger.error(f"❌ MongoDB failed: {str(e)}")
     try:
         redis_client = await aioredis.from_url(REDIS_URL, decode_responses=True)
         await redis_client.ping()
         logger.info("✅ Redis connected")
     except Exception as e:
-        logger.error(f"❌ Redis connection failed: {str(e)}")
-
-    logger.info(f"FAQ Agent:         {FAQ_URL}")
-    logger.info(f"Payroll Agent:     {PAYROLL_URL}")
-    logger.info(f"Leave Agent:       {LEAVE_URL}")
-    logger.info(f"Recruitment Agent: {RECRUITMENT_URL}")
-    logger.info(f"Performance Agent: {PERFORMANCE_URL}")
-    logger.info(f"Session TTL:       {SESSION_TTL}s ({SESSION_TTL // 3600}hr)")
-    logger.info("=" * 60)
+        logger.error(f"❌ Redis failed: {str(e)}")
 
 @app.on_event("shutdown")
 async def shutdown_event():
     await http_client.aclose()
     if mongo_client:
         mongo_client.close()
-        logger.info("🔌 MongoDB connection closed")
     if redis_client:
         await redis_client.aclose()
-        logger.info("🔌 Redis connection closed")
 
 # ─────────────────────────────────────────────
 # Health Check
 # ─────────────────────────────────────────────
 @app.get("/health")
 async def health_check():
-    mongo_status = "disconnected"
-    redis_status = "disconnected"
-
+    mongo_status = redis_status = "disconnected"
     try:
         if mongo_client:
             await mongo_client.admin.command("ping")
             mongo_status = "connected"
     except Exception:
         mongo_status = "error"
-
     try:
         if redis_client:
             await redis_client.ping()
             redis_status = "connected"
     except Exception:
         redis_status = "error"
-
     return {
-        "status":         "healthy",
-        "service":        "coordinator-agent",
-        "version":        "2.0.0",
-        "openai_status":  "configured" if OPENAI_API_KEY else "missing",
-        "mongodb_status": mongo_status,
-        "redis_status":   redis_status,
-        "agents_connected": {
-            "faq":         FAQ_URL,
-            "payroll":     PAYROLL_URL,
-            "leave":       LEAVE_URL,
-            "recruitment": RECRUITMENT_URL,
-            "performance": PERFORMANCE_URL
-        }
+        "status": "healthy", "service": "coordinator-agent", "version": "3.0.0",
+        "mode": "plan-and-execute-multi-step",
+        "openai_status": "configured" if OPENAI_API_KEY else "missing",
+        "mongodb_status": mongo_status, "redis_status": redis_status,
+        "agents": {k: url for k, url in [("faq", FAQ_URL), ("payroll", PAYROLL_URL),
+                                           ("leave", LEAVE_URL), ("recruitment", RECRUITMENT_URL),
+                                           ("performance", PERFORMANCE_URL)]}
     }
 
 # ─────────────────────────────────────────────
-# Main Endpoint — Ask Coordinator
+# Main Endpoint — Plan-and-Execute
 # ─────────────────────────────────────────────
 @app.post("/api/coordinator/ask", response_model=CoordinatorResponse)
 async def ask_coordinator(request: CoordinatorRequest):
     try:
         logger.info(f"📥 Coordinator received: {request.query}")
-
         conv_id     = request.conversation_id or str(uuid.uuid4())
         employee_id = request.employee_id or "anonymous"
 
-        # ── Guardrail: intercept sensitive/malicious queries ─────────────────
-        query_lower = request.query.lower()
-        if any(kw in query_lower for kw in COORDINATOR_SENSITIVE_KEYWORDS):
-            logger.warning(f"🚨 Sensitive coordinator query intercepted: {request.query}")
+        # ── Guardrail ─────────────────────────────────────────────────────────
+        if any(kw in request.query.lower() for kw in COORDINATOR_SENSITIVE_KEYWORDS):
+            logger.warning(f"🚨 Guardrail triggered: {request.query}")
             await log_message(conv_id, "user",      request.query,                   employee_id, flagged=True)
             await log_message(conv_id, "assistant", COORDINATOR_ESCALATION_RESPONSE, employee_id, flagged=True)
             return CoordinatorResponse(
-                answer=COORDINATOR_ESCALATION_RESPONSE,
-                agent_used="guardrail",
-                confidence=1.0,
-                conversation_id=conv_id,
-                metadata={"flagged": True, "timestamp": datetime.now().isoformat()}
+                answer=COORDINATOR_ESCALATION_RESPONSE, agent_used="guardrail",
+                confidence=1.0, conversation_id=conv_id, plan_executed=[], tools_used=[],
+                metadata={"flagged": True}
             )
 
-        # ── Level 2: Load session context from MongoDB ───────────────────────
+        # ── Level 2: Redis session ────────────────────────────────────────────
         session = await get_session(employee_id)
         if session:
-            logger.info(
-                f"📦 Session loaded — last service: {session.get('last_service')}, "
-                f"last topic: {str(session.get('last_topic', ''))[:50]}"
-            )
+            logger.info(f"📦 Session: last={session.get('last_service')}, topic={str(session.get('last_topic',''))[:40]}")
 
-        # ── Level 1: Load conversation history from MongoDB ──────────────────
+        # ── Level 1: MongoDB conversation history ─────────────────────────────
         history = await get_conversation_history(conv_id, limit=10)
-        logger.info(f"💬 Loaded {len(history)} previous messages from coordinator history")
+        logger.info(f"💬 {len(history)} historical messages loaded")
 
-        # ── Meta-query intercept ─────────────────────────────────────────────
-        # Questions about the conversation itself (e.g. "what was my first
-        # question?") are answered directly by the coordinator using its own
-        # chat_history — the only store with the full cross-service record.
-        # Routing these downstream would fail because each agent only holds
-        # its own slice of history, not turns handled by other agents.
+        # ── Meta-query intercept ──────────────────────────────────────────────
         if await is_meta_query(request.query):
-            logger.info("🧠 Meta-query detected — answering from coordinator history")
-            answer = await handle_meta_query(request.query, history, employee_id)
-            await log_message(conv_id, "user",      request.query, employee_id, agent_used=None)
+            logger.info("🧠 Meta-query detected")
+            answer = await handle_meta_query(request.query, history)
+            await log_message(conv_id, "user",      request.query, employee_id)
             await log_message(conv_id, "assistant", answer,        employee_id, agent_used="Coordinator")
             return CoordinatorResponse(
-                answer=answer,
-                agent_used="Coordinator",
-                confidence=0.99,
-                conversation_id=conv_id,
-                metadata={
-                    "routing_method": "meta_query_direct",
-                    "timestamp":      datetime.now().isoformat(),
-                    "employee_id":    employee_id,
-                    "history_used":   len(history),
-                }
+                answer=answer, agent_used="Coordinator", confidence=0.99,
+                conversation_id=conv_id, plan_executed=["Coordinator"], tools_used=[],
+                metadata={"routing_method": "meta_query"}
             )
 
-        # ── Route to appropriate agent ───────────────────────────────────────
-        result = await route_query_intelligent(
-            query=request.query,
-            employee_id=employee_id,
-            conv_id=conv_id,
-            session=session,
-            history=history
-        )
+        # ── PLAN — decide which agents to call and in what order ──────────────
+        plan = await create_plan(request.query, session, history)
+        logger.info(f"📋 Execution plan: {plan}")
 
-        if not result.get("success"):
-            raise HTTPException(status_code=500, detail=result.get("answer"))
+        # ── EXECUTE — run each step, passing context forward ──────────────────
+        execution = await execute_plan(plan, request.query, employee_id, conv_id)
+        step_results = execution["step_results"]
+        all_tools    = execution["all_tools"]
 
-        agent_used = result["agent"]
-        answer     = result["answer"]
-        logger.info(f"✅ Routed to {agent_used} agent successfully")
+        if not step_results or not any(r.get("success") for r in step_results):
+            raise HTTPException(status_code=500, detail="All agent steps failed")
 
-        # ── Persist coordinator-level exchange ───────────────────────────────
+        # ── SYNTHESISE — merge multi-step results into one response ───────────
+        final_answer = await synthesise_results(request.query, step_results)
+        agents_used  = [r["agent"] for r in step_results]
+        agent_label  = " + ".join(agents_used)
+        logger.info(f"✅ Plan complete: {agent_label}")
+
+        # ── Persist ───────────────────────────────────────────────────────────
         await log_message(conv_id, "user",      request.query, employee_id, agent_used=None)
-        await log_message(conv_id, "assistant", answer,        employee_id, agent_used=agent_used)
+        await log_message(conv_id, "assistant", final_answer,  employee_id, agent_used=agent_label)
 
-        # ── Update MongoDB session ────────────────────────────────────────────
+        # ── Update Redis session ──────────────────────────────────────────────
         await save_session(employee_id, {
-            "last_service": agent_used.lower(),
+            "last_service": agents_used[-1].lower(),
             "last_topic":   request.query[:100]
         })
 
         return CoordinatorResponse(
-            answer=answer,
-            agent_used=agent_used,
+            answer=final_answer,
+            agent_used=agent_label,
             confidence=0.95,
             conversation_id=conv_id,
+            plan_executed=plan,
+            tools_used=all_tools,
             metadata={
-                "routing_method": "context_aware_with_history",
+                "routing_method": "plan_and_execute",
+                "steps":          len(plan),
                 "timestamp":      datetime.now().isoformat(),
                 "employee_id":    employee_id,
                 "history_used":   len(history),
@@ -675,82 +543,57 @@ async def ask_coordinator(request: CoordinatorRequest):
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"❌ Coordinator error: {str(e)}")
+        logger.error(f"❌ Coordinator error: {traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=str(e))
 
 # ─────────────────────────────────────────────
-# List Agents
+# Supporting Endpoints
 # ─────────────────────────────────────────────
 @app.get("/api/coordinator/agents")
 async def list_agents():
     return {
         "agents": [
-            {"name": "FAQ",         "description": "General HR questions and company policies",  "url": FAQ_URL},
-            {"name": "Payroll",     "description": "Salary, payslips, and compensation",          "url": PAYROLL_URL},
-            {"name": "Leave",       "description": "Leave management and balance enquiries",      "url": LEAVE_URL},
-            {"name": "Recruitment", "description": "Job openings and hiring process",             "url": RECRUITMENT_URL},
-            {"name": "Performance", "description": "Goals, KPIs, and performance reviews",       "url": PERFORMANCE_URL},
+            {"name": "FAQ",         "url": FAQ_URL,         "description": "HR policies and general questions"},
+            {"name": "Payroll",     "url": PAYROLL_URL,     "description": "Salary, payslips, deductions"},
+            {"name": "Leave",       "url": LEAVE_URL,       "description": "Leave balance and requests"},
+            {"name": "Recruitment", "url": RECRUITMENT_URL, "description": "Job openings and hiring"},
+            {"name": "Performance", "url": PERFORMANCE_URL, "description": "Goals, KPIs, reviews"},
         ],
-        "routing_strategy": "Context-aware routing with MongoDB chat history + MongoDB session state"
+        "routing_strategy": "GPT-4o-mini plan-and-execute with step-by-step context passing"
     }
 
-# ─────────────────────────────────────────────
-# Chat History Endpoints
-# ─────────────────────────────────────────────
 @app.get("/api/coordinator/history/chat")
 async def get_chat_history(employee_id: str, limit: int = 50):
-    """All coordinator-level chat messages for an employee, newest first."""
     if db is None:
         raise HTTPException(status_code=500, detail="Database not connected")
-
     cursor = db.chat_history.find(
-        {"employee_id": employee_id, "service": "coordinator"},
-        sort=[("timestamp", -1)]
+        {"employee_id": employee_id, "service": "coordinator"}, sort=[("timestamp", -1)]
     ).limit(limit)
-
     history = await cursor.to_list(length=limit)
-
-    def serialize(doc):
-        if "_id" in doc:
-            doc["id"] = str(doc["_id"])
-            del doc["_id"]
-        return doc
-
-    return {"employee_id": employee_id, "history": [serialize(h) for h in history]}
+    def ser(d):
+        if "_id" in d:
+            d["id"] = str(d["_id"]); del d["_id"]
+        return d
+    return {"employee_id": employee_id, "history": [ser(h) for h in history]}
 
 @app.get("/api/coordinator/history/chat/{conversation_id}")
 async def get_conversation(conversation_id: str):
-    """All messages in a specific conversation thread, in chronological order."""
     if db is None:
         raise HTTPException(status_code=500, detail="Database not connected")
-
-    cursor = db.chat_history.find(
-        {"conversation_id": conversation_id},
-        sort=[("timestamp", 1)]
-    )
-
+    cursor = db.chat_history.find({"conversation_id": conversation_id}, sort=[("timestamp", 1)])
     messages = await cursor.to_list(length=200)
+    def ser(d):
+        if "_id" in d:
+            d["id"] = str(d["_id"]); del d["_id"]
+        return d
+    return {"conversation_id": conversation_id, "messages": [ser(m) for m in messages]}
 
-    def serialize(doc):
-        if "_id" in doc:
-            doc["id"] = str(doc["_id"])
-            del doc["_id"]
-        return doc
-
-    return {"conversation_id": conversation_id, "messages": [serialize(m) for m in messages]}
-
-# ─────────────────────────────────────────────
-# Session Inspection
-# ─────────────────────────────────────────────
 @app.get("/api/coordinator/session/{employee_id}")
 async def get_employee_session(employee_id: str):
-    """Return the current session state for an employee. Useful for debugging."""
     session = await get_session(employee_id)
     if not session:
         return {"employee_id": employee_id, "session": None, "message": "No active session"}
     return {"employee_id": employee_id, "session": session}
 
-
 if __name__ == "__main__":
-    port = int(os.getenv("PORT", 8007))
-    uvicorn.run(app, host="0.0.0.0", port=port)
+    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 8007)))

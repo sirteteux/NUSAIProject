@@ -9,7 +9,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional, Dict, List, Any
-import os, json, uuid, traceback
+import sys, os, json, uuid, traceback
 from dotenv import load_dotenv
 import logging
 from openai import OpenAI
@@ -19,13 +19,15 @@ import uvicorn
 from motor.motor_asyncio import AsyncIOMotorClient
 from bson import ObjectId
 import redis.asyncio as aioredis
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from react_engine import build_react_system_prompt, REACT_INSTRUCTION, REEVAL_PROMPT, FINAL_ANSWER_MARKER
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 app = FastAPI(title="Coordinator Agent",
-              description="Multi-Step Plan-and-Execute Orchestrator", version="3.0.0")
+              description="ReAct Multi-Step Plan-and-Execute Orchestrator", version="3.1.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True,
                    allow_methods=["*"], allow_headers=["*"])
 
@@ -62,8 +64,9 @@ class CoordinatorResponse(BaseModel):
     agent_used: str
     confidence: float
     conversation_id: str
-    plan_executed: List[str] = []     # which agents were called in order
-    tools_used: List[str] = []        # all tools fired across all agents
+    plan_executed: List[str] = []
+    tools_used: List[str] = []
+    thoughts: List[str] = []      # ReAct reasoning trace — visible for audit
     metadata: Optional[Dict] = None
 
 # ─────────────────────────────────────────────
@@ -246,13 +249,20 @@ async def handle_meta_query(query: str, history: List[Dict]) -> str:
 # ─────────────────────────────────────────────
 # PLANNER — creates a step-by-step plan
 # ─────────────────────────────────────────────
+# PLANNER — ReAct-style: explicit Thought before plan
+# ─────────────────────────────────────────────
 async def create_plan(query: str, session: Dict, history: List[Dict]) -> List[str]:
     """
-    Ask GPT to decompose the query into an ordered list of agent calls.
-    Returns a list like ["Performance", "Payroll"] for multi-step queries,
-    or ["FAQ"] for simple single-agent queries.
+    Uses a ReAct-style prompt to reason explicitly before producing a plan.
+
+    The model outputs:
+      Thought: <reasoning about the query and what agents are needed>
+      Plan: <JSON array>
+
+    This makes the planning decision auditable and forces the model to
+    justify its agent selection rather than pattern-matching silently.
     """
-    session_hint  = ""
+    session_hint = ""
     if session.get("last_service") and session.get("last_topic"):
         session_hint = (f"\nSession context: Employee recently asked about "
                         f"'{session['last_topic']}' via {session['last_service']} agent.")
@@ -264,55 +274,71 @@ async def create_plan(query: str, session: Dict, history: List[Dict]) -> List[st
                  f"{m['message'][:100]}" for m in history[-6:]]
         history_hint = "\nRecent conversation:\n" + "\n".join(lines)
 
-    planning_prompt = f"""You are an intelligent planner for an HR system.
-Analyse the user query and create an execution plan — an ordered list of agents to call.
+    planning_prompt = f"""You are a ReAct planner for an HR multi-agent system.
 
-Rules:
-- Simple queries needing ONE agent: return a single-item list, e.g. ["FAQ"]
-- Complex queries needing MULTIPLE agents: return them in order, e.g. ["Performance", "Payroll"]
-- Later steps get the output of earlier steps as context
-- Maximum 3 agents per plan
+Your job is to analyse the user's query and select the right agents to call.
+
 {session_hint}
 {history_hint}
 
-Available agents:
-- FAQ: general HR questions, policies, benefits, office info
-- Payroll: salary, payslips, deductions, CPF, tax
-- Leave: leave balance, requests, approvals
-- Recruitment: job openings, hiring process
-- Performance: goals, KPIs, performance reviews
+Each agent has two properties — the TOPICS it knows about, and the ACTIONS it can perform:
 
-Example multi-step queries and their plans:
-- "Show my performance review and what bonus I might get" → ["Performance", "Payroll"]
-- "How much leave do I have and what is the process to apply?" → ["Leave", "FAQ"]
-- "What jobs are open and what is the salary for the data scientist role?" → ["Recruitment"]
-- "What are my goals and when is my next review?" → ["Performance"]
+Agent        | Topics                                      | Can perform actions?
+-------------|---------------------------------------------|---------------------
+FAQ          | Policies, benefits, office info, procedures | NO — information only
+Payroll      | Salary, payslips, deductions, CPF, tax      | NO — information only
+Leave        | Leave balances, leave history               | YES — can submit, approve, cancel leave requests
+Recruitment  | Job openings, hiring process                | YES — can create job postings
+Performance  | Goals, KPIs, reviews                        | YES — can create goals, update progress
+
+Reasoning approach:
+1. Identify what INFORMATION the query needs → which agent knows that topic?
+2. Identify what ACTIONS the query needs → which agent can perform that action?
+3. If both are needed, include both agents (information agent first, then action agent)
+4. Maximum 3 agents. Later agents receive earlier agents' answers as context.
+
+Follow this format EXACTLY:
+
+Thought: <What information is needed? What actions are needed? Which agents cover each?>
+Plan: <valid JSON array, e.g. ["FAQ", "Leave"]>
 
 User query: "{query}"
-
-Respond with ONLY a valid JSON array of agent names, e.g. ["Performance", "Payroll"]
-No explanation, no markdown, just the JSON array."""
+"""
 
     try:
-        resp       = openai_client.chat.completions.create(
+        resp = openai_client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[{"role": "user", "content": planning_prompt}],
-            temperature=0.0, max_tokens=50
+            temperature=0.0, max_tokens=200
         )
-        raw   = resp.choices[0].message.content.strip()
-        plan  = json.loads(raw)
+        raw = resp.choices[0].message.content.strip()
+
+        # Log the Thought for auditability
+        if "Thought:" in raw:
+            thought = raw.split("Thought:")[1].split("Plan:")[0].strip()
+            logger.info(f"💭 Planner Thought: {thought[:200]}")
+
+        # Extract the Plan JSON
+        if "Plan:" in raw:
+            plan_raw = raw.split("Plan:")[-1].strip()
+        else:
+            plan_raw = raw
+
+        plan  = json.loads(plan_raw)
         valid = [a for a in plan if a in AGENT_DISPATCH]
         if not valid:
-            logger.warning(f"⚠️ Plan contained no valid agents: {raw}")
+            logger.warning(f"⚠️ Plan contained no valid agents: {plan_raw}")
             return ["FAQ"]
         logger.info(f"📋 Plan created: {valid}")
         return valid
+
     except Exception as e:
         logger.error(f"❌ Planner failed: {str(e)} — defaulting to FAQ")
         return ["FAQ"]
 
+
 # ─────────────────────────────────────────────
-# EXECUTOR — runs the plan step by step
+# EXECUTOR — ReAct-style: re-evaluate after each step
 # ─────────────────────────────────────────────
 async def execute_plan(
     plan: List[str],
@@ -321,18 +347,25 @@ async def execute_plan(
     conv_id: str
 ) -> Dict:
     """
-    Execute each agent in the plan sequentially.
-    Each step's answer is appended as context to the next step's query,
-    enabling true multi-step reasoning across domain boundaries.
+    Execute each agent step sequentially with ReAct re-evaluation.
+
+    After each step the coordinator asks itself:
+      "Do I now have enough information to answer the original question,
+       or does the next planned step still add value?"
+
+    This means the coordinator can short-circuit a multi-step plan if
+    an earlier step already provides a complete answer, avoiding
+    unnecessary downstream calls and token spend.
     """
-    step_results  = []
-    all_tools     = []
+    step_results       = []
+    all_tools          = []
     cumulative_context = ""
+    thoughts           = []
 
     for i, agent_name in enumerate(plan):
         logger.info(f"▶️  Step {i+1}/{len(plan)}: calling {agent_name} agent")
 
-        # Build enriched query — original query + context from all previous steps
+        # Build enriched query with cumulative context from prior steps
         if cumulative_context:
             enriched_query = (
                 f"{original_query}\n\n"
@@ -350,21 +383,56 @@ async def execute_plan(
         step_results.append(result)
         all_tools.extend(result.get("tools_used", []))
 
-        # Append this step's answer to cumulative context for next step
         if result.get("answer"):
             cumulative_context += f"\n{agent_name} Agent: {result['answer']}"
 
-        logger.info(f"✅ Step {i+1} complete — {agent_name}: {result['answer'][:80]}...")
+        logger.info(f"✅ Step {i+1} ({agent_name}) done: {result['answer'][:80]}...")
 
-    return {"step_results": step_results, "all_tools": all_tools}
+        # ── ReAct re-evaluation after each step ──────────────────────────────
+        # Only bother if there are more steps remaining in the plan
+        remaining = plan[i+1:]
+        if remaining:
+            reeval_prompt = (
+                f"Original question: {original_query}\n\n"
+                f"Results so far:\n{cumulative_context}\n\n"
+                f"Remaining planned steps: {remaining}\n\n"
+                f"Thought: Do I already have sufficient information to fully answer "
+                f"the original question? Or do the remaining steps add essential value?\n\n"
+                f"Reply with ONLY one of:\n"
+                f"  CONTINUE — remaining steps are needed\n"
+                f"  DONE — I already have enough information"
+            )
+            try:
+                eval_resp = openai_client.chat.completions.create(
+                    model="gpt-4o-mini",
+                    messages=[{"role": "user", "content": reeval_prompt}],
+                    temperature=0.0, max_tokens=20
+                )
+                decision = eval_resp.choices[0].message.content.strip().upper()
+                thoughts.append(f"Step {i+1} re-eval: {decision}")
+                logger.info(f"🤔 Re-evaluation after step {i+1}: {decision}")
+
+                if "DONE" in decision:
+                    logger.info(
+                        f"⚡ Short-circuiting plan at step {i+1} — "
+                        f"skipping {remaining}"
+                    )
+                    break   # goal already achieved — skip remaining agents
+
+            except Exception as e:
+                logger.warning(f"⚠️ Re-evaluation failed: {str(e)} — continuing plan")
+
+    return {"step_results": step_results, "all_tools": all_tools, "thoughts": thoughts}
+
 
 # ─────────────────────────────────────────────
-# SYNTHESISER — combines multi-step results
+# SYNTHESISER — ReAct Final Answer format
 # ─────────────────────────────────────────────
 async def synthesise_results(original_query: str, step_results: List[Dict]) -> str:
     """
-    If only one step was executed, return its answer directly.
-    If multiple steps, ask GPT to synthesise a unified coherent response.
+    If only one step ran, return its answer directly.
+    If multiple steps ran, use a ReAct-style synthesis prompt that forces
+    explicit reasoning before the final answer.
     """
     if len(step_results) == 1:
         return step_results[0].get("answer", "I was unable to generate a response.")
@@ -376,23 +444,40 @@ async def synthesise_results(original_query: str, step_results: List[Dict]) -> s
 
     synthesis_prompt = (
         f"You are synthesising results from multiple HR specialist agents.\n"
+        f"Follow the ReAct format:\n\n"
+        f"Thought: Review the specialist responses below and reason about how they "
+        f"collectively answer the original question. Identify any gaps or contradictions.\n\n"
+        f"Final Answer: Provide a single, coherent, well-structured response that "
+        f"addresses ALL aspects of the original question. Do not repeat agent labels.\n\n"
+        f"---\n"
         f"Original question: {original_query}\n\n"
-        f"Specialist responses:\n{results_text}\n\n"
-        f"Provide a single, coherent, well-structured response that addresses all aspects "
-        f"of the original question using the specialist information above. "
-        f"Do not repeat agent labels — just give the unified answer."
+        f"Specialist responses:\n{results_text}\n"
+        f"---\n\n"
+        f"Now produce your Thought and Final Answer:"
     )
 
     try:
         resp = openai_client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[{"role": "user", "content": synthesis_prompt}],
-            temperature=0.3, max_tokens=700
+            temperature=0.2, max_tokens=800
         )
-        return resp.choices[0].message.content.strip()
+        raw = resp.choices[0].message.content.strip()
+
+        # Log the synthesis Thought
+        if "Thought:" in raw:
+            thought = raw.split("Thought:")[1].split("Final Answer:")[0].strip()
+            logger.info(f"💭 Synthesis Thought: {thought[:150]}")
+
+        # Extract Final Answer
+        if FINAL_ANSWER_MARKER in raw:
+            return raw.split(FINAL_ANSWER_MARKER, 1)[-1].strip()
+
+        # Fallback — model responded without the marker
+        return raw.strip()
+
     except Exception as e:
         logger.error(f"❌ Synthesis failed: {str(e)}")
-        # Fallback: concatenate answers
         return "\n\n".join([f"**{r['agent']}:** {r['answer']}" for r in step_results])
 
 # ─────────────────────────────────────────────
@@ -444,8 +529,8 @@ async def health_check():
     except Exception:
         redis_status = "error"
     return {
-        "status": "healthy", "service": "coordinator-agent", "version": "3.0.0",
-        "mode": "plan-and-execute-multi-step",
+        "status": "healthy", "service": "coordinator-agent", "version": "3.1.0",
+        "mode": "react-plan-and-execute",
         "openai_status": "configured" if OPENAI_API_KEY else "missing",
         "mongodb_status": mongo_status, "redis_status": redis_status,
         "agents": {k: url for k, url in [("faq", FAQ_URL), ("payroll", PAYROLL_URL),
@@ -499,19 +584,26 @@ async def ask_coordinator(request: CoordinatorRequest):
         plan = await create_plan(request.query, session, history)
         logger.info(f"📋 Execution plan: {plan}")
 
-        # ── EXECUTE — run each step, passing context forward ──────────────────
-        execution = await execute_plan(plan, request.query, employee_id, conv_id)
+        # ── EXECUTE — run each step with ReAct re-evaluation between steps ─────
+        execution    = await execute_plan(plan, request.query, employee_id, conv_id)
         step_results = execution["step_results"]
         all_tools    = execution["all_tools"]
+        plan_thoughts= execution.get("thoughts", [])
 
         if not step_results or not any(r.get("success") for r in step_results):
             raise HTTPException(status_code=500, detail="All agent steps failed")
 
-        # ── SYNTHESISE — merge multi-step results into one response ───────────
+        # ── SYNTHESISE — ReAct Thought + Final Answer format ───────────────────
         final_answer = await synthesise_results(request.query, step_results)
         agents_used  = [r["agent"] for r in step_results]
         agent_label  = " + ".join(agents_used)
-        logger.info(f"✅ Plan complete: {agent_label}")
+
+        # Collect all thoughts from domain agents too
+        all_thoughts = plan_thoughts + [
+            t for r in step_results
+            for t in r.get("thoughts", [])
+        ]
+        logger.info(f"✅ ReAct plan complete: {agent_label} | {len(all_thoughts)} thoughts logged")
 
         # ── Persist ───────────────────────────────────────────────────────────
         await log_message(conv_id, "user",      request.query, employee_id, agent_used=None)
@@ -528,15 +620,18 @@ async def ask_coordinator(request: CoordinatorRequest):
             agent_used=agent_label,
             confidence=0.95,
             conversation_id=conv_id,
-            plan_executed=plan,
+            plan_executed=agents_used,   # actual agents called (may differ from plan after short-circuit)
             tools_used=all_tools,
+            thoughts=all_thoughts,
             metadata={
-                "routing_method": "plan_and_execute",
-                "steps":          len(plan),
-                "timestamp":      datetime.now().isoformat(),
-                "employee_id":    employee_id,
-                "history_used":   len(history),
-                "session_loaded": bool(session)
+                "routing_method":  "react_plan_and_execute",
+                "planned_steps":   plan,
+                "executed_steps":  len(step_results),
+                "short_circuited": len(plan) > len(step_results),
+                "timestamp":       datetime.now().isoformat(),
+                "employee_id":     employee_id,
+                "history_used":    len(history),
+                "session_loaded":  bool(session)
             }
         )
 
@@ -559,7 +654,7 @@ async def list_agents():
             {"name": "Recruitment", "url": RECRUITMENT_URL, "description": "Job openings and hiring"},
             {"name": "Performance", "url": PERFORMANCE_URL, "description": "Goals, KPIs, reviews"},
         ],
-        "routing_strategy": "GPT-4o-mini plan-and-execute with step-by-step context passing"
+        "routing_strategy": "ReAct plan-and-execute: Thought → Plan → Execute (with re-evaluation) → Synthesise (Final Answer)"
     }
 
 @app.get("/api/coordinator/history/chat")

@@ -10,7 +10,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional, List, Dict
-import os
+import sys, os
 from dotenv import load_dotenv
 import logging
 from openai import OpenAI
@@ -20,12 +20,14 @@ import uuid
 import json
 from motor.motor_asyncio import AsyncIOMotorClient
 from datetime import datetime
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from react_engine import run_react_loop, build_react_system_prompt
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="FAQ Agent", description="HR Knowledge Base AI Agent", version="2.0.0")
+app = FastAPI(title="FAQ Agent", description="HR Knowledge Base ReAct AI Agent", version="3.0.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
@@ -57,10 +59,8 @@ class QuestionResponse(BaseModel):
 SENSITIVE_KEYWORDS = ['salary', 'fire', 'terminate', 'lawsuit', 'harassment', 'discrimination']
 CONTEXT_MARKER     = "[Prior conversation context:"
 
-SYSTEM_PROMPT = """You are ResourcefulAI's HR Knowledge Assistant — a helpful, professional virtual assistant for employees.
+_FAQ_BASE_PROMPT = """You are ResourcefulAI's HR Knowledge Assistant — a professional virtual assistant for employees.
 
-Answer the users HR-related query using ONLY the company information provided.
-If the question is outside your scope or information is missing, direct the user to HR at hr@company.com.
 You have access to tools that let you look up real company data. Always use tools to retrieve
 accurate information before answering. Do not answer from memory alone when a tool can verify it.
 
@@ -81,6 +81,9 @@ DO NOT provide medical, legal, or financial advice
 DO NOT discuss other employees' personal information or salaries
 DO NOT handle harassment/discrimination complaints (escalate to HR)
 DO NOT make commitments on behalf of management"""
+
+# Wrap with ReAct instruction — forces explicit Thought/Action/Observation/Final Answer cycle
+SYSTEM_PROMPT = build_react_system_prompt(_FAQ_BASE_PROMPT)
 
 # ─────────────────────────────────────────────
 # Tool Definitions
@@ -303,58 +306,32 @@ async def ask_question(request: QuestionRequest):
             messages.append({"role": msg["role"], "content": msg["message"]})
         messages.append({"role": "user", "content": request.question})
 
-        # ── Agentic loop ──────────────────────────────────────────────────────
-        tools_used = []
-        max_iterations = 5
+        # ── Genuine ReAct loop ────────────────────────────────────────────────
+        # Thought → Action → Observation → re-evaluate → Final Answer
+        result = await run_react_loop(
+            openai_client=client,
+            messages=messages,
+            tools=FAQ_TOOLS,
+            tool_executor=lambda name, args: execute_tool(name, args, request.user_id),
+            service_name="FAQ",
+            max_iterations=8,
+        )
 
-        for iteration in range(max_iterations):
-            logger.info(f"🔄 FAQ agent iteration {iteration + 1}")
-            response = client.chat.completions.create(
-                model="gpt-4o-mini",
-                messages=messages,
-                tools=FAQ_TOOLS,
-                tool_choice="auto",
-                temperature=0.3,
-                max_tokens=600
-            )
+        answer     = result["answer"]
+        tools_used = result["tools_used"]
 
-            msg = response.choices[0].message
-            messages.append(msg)
+        logger.info(
+            f"✅ FAQ ReAct complete — {result['iterations']} iteration(s), "
+            f"tools: {tools_used}, thoughts: {len(result['thoughts'])}"
+        )
 
-            # If no tool calls, we have the final answer
-            if not msg.tool_calls:
-                answer = msg.content.strip() if msg.content else "I was unable to generate a response."
-                logger.info(f"✅ FAQ agent finished after {iteration + 1} iteration(s), tools used: {tools_used}")
-
-                await log_message(conv_id, "user",      request.question, request.user_id)
-                await log_message(conv_id, "assistant", answer,           request.user_id)
-
-                return QuestionResponse(
-                    answer=answer, question=request.question,
-                    confidence=0.95, conversation_id=conv_id, tools_used=tools_used
-                )
-
-            # Execute all tool calls in this round
-            for tool_call in msg.tool_calls:
-                tool_name = tool_call.function.name
-                tool_args = json.loads(tool_call.function.arguments)
-                logger.info(f"🔧 FAQ agent calling tool: {tool_name}({tool_args})")
-
-                tool_result = await execute_tool(tool_name, tool_args, request.user_id)
-                tools_used.append(tool_name)
-
-                messages.append({
-                    "role":         "tool",
-                    "tool_call_id": tool_call.id,
-                    "content":      tool_result
-                })
-
-        # Fallback if max iterations reached
-        answer = "I reached the maximum reasoning steps. Please try rephrasing your question or contact HR directly."
         await log_message(conv_id, "user",      request.question, request.user_id)
         await log_message(conv_id, "assistant", answer,           request.user_id)
-        return QuestionResponse(answer=answer, question=request.question,
-                                confidence=0.5, conversation_id=conv_id, tools_used=tools_used)
+
+        return QuestionResponse(
+            answer=answer, question=request.question,
+            confidence=0.95, conversation_id=conv_id, tools_used=tools_used
+        )
 
     except HTTPException:
         raise

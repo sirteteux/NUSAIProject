@@ -8,7 +8,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional, Dict, List
-import os, json, uuid, traceback
+import sys, os, json, uuid, traceback
 from dotenv import load_dotenv
 import logging
 from openai import OpenAI
@@ -16,6 +16,8 @@ from datetime import datetime, timedelta
 import uvicorn
 from motor.motor_asyncio import AsyncIOMotorClient
 from bson import ObjectId
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from react_engine import run_react_loop, build_react_system_prompt
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -53,7 +55,7 @@ LEAVE_ESCALATION_RESPONSE = (
     "Please contact hr@company.com or call +65 6123 4567."
 )
 
-LEAVE_SYSTEM_PROMPT = """You are a Leave Management AI Agent for ResourcefulAI. You have tools to look up balances and submit requests.
+_LEAVE_SYSTEM_PROMPT_BASE = """You are a Leave Management AI Agent for ResourcefulAI. You have tools to look up balances and submit requests.
 
 Always use tools to retrieve real data before answering. You can:
 - Check leave balances
@@ -70,6 +72,9 @@ GUARDRAILS:
 Company Leave Policy:
 - Annual: 18 days/year | Sick: 14 days/year | Personal: 3 days/year
 - Requests should be submitted 2 weeks in advance (except sick leave)"""
+
+# Wrap with ReAct instruction
+LEAVE_SYSTEM_PROMPT = build_react_system_prompt(_LEAVE_SYSTEM_PROMPT_BASE)
 
 # ─────────────────────────────────────────────
 # Tool Definitions
@@ -387,51 +392,26 @@ async def query_leave(request: LeaveQueryRequest):
             messages.append({"role": msg["role"], "content": msg["message"]})
         messages.append({"role": "user", "content": request.query})
 
-        tools_used    = []
-        leave_data    = None
-        max_iterations = 6
-
-        for iteration in range(max_iterations):
-            logger.info(f"🔄 Leave agent iteration {iteration + 1}")
-            response = client.chat.completions.create(
-                model="gpt-4o-mini",
-                messages=messages,
-                tools=LEAVE_TOOLS,
-                tool_choice="auto",
-                temperature=0.2,
-                max_tokens=600
-            )
-
-            msg = response.choices[0].message
-            messages.append(msg)
-
-            if not msg.tool_calls:
-                answer = msg.content.strip() if msg.content else "I was unable to generate a response."
-                logger.info(f"✅ Leave agent done after {iteration + 1} iteration(s)")
-                await log_message(conv_id, "user",      request.query, request.employee_id)
-                await log_message(conv_id, "assistant", answer,        request.employee_id)
-                return LeaveQueryResponse(answer=answer, data=leave_data,
-                                          conversation_id=conv_id, tools_used=tools_used)
-
-            for tool_call in msg.tool_calls:
-                tool_name   = tool_call.function.name
-                tool_args   = json.loads(tool_call.function.arguments)
-                logger.info(f"🔧 Leave calling tool: {tool_name}({tool_args})")
-                tool_result = await execute_tool(tool_name, tool_args)
-                tools_used.append(tool_name)
-
-                if tool_name == "get_leave_balance":
-                    try:
-                        leave_data = json.loads(tool_result)
-                    except Exception:
-                        pass
-
-                messages.append({"role": "tool", "tool_call_id": tool_call.id, "content": tool_result})
-
-        answer = "I reached the maximum reasoning steps. Please try rephrasing your question."
-        await log_message(conv_id, "user", request.query, request.employee_id)
-        await log_message(conv_id, "assistant", answer, request.employee_id)
-        return LeaveQueryResponse(answer=answer, data=None, conversation_id=conv_id, tools_used=tools_used)
+        # ── Genuine ReAct loop ────────────────────────────────────────────
+        leave_data = None
+        result = await run_react_loop(
+            openai_client=client,
+            messages=messages,
+            tools=LEAVE_TOOLS,
+            tool_executor=execute_tool,
+            service_name="Leave",
+            max_iterations=8,
+        )
+        answer     = result["answer"]
+        tools_used = result["tools_used"]
+        logger.info(
+            f"✅ Leave ReAct complete — {result['iterations']} iteration(s), "
+            f"tools: {tools_used}, thoughts: {len(result['thoughts'])}"
+        )
+        await log_message(conv_id, "user",      request.query, request.employee_id)
+        await log_message(conv_id, "assistant", answer,        request.employee_id)
+        return LeaveQueryResponse(answer=answer, data=leave_data,
+                                            conversation_id=conv_id, tools_used=tools_used)
 
     except HTTPException:
         raise

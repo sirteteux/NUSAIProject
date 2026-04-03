@@ -7,7 +7,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional, Dict, List
-import os, json, uuid, traceback
+import sys, os, json, uuid, traceback
 from dotenv import load_dotenv
 import logging
 from openai import OpenAI
@@ -15,12 +15,14 @@ from datetime import datetime
 import uvicorn
 from motor.motor_asyncio import AsyncIOMotorClient
 from bson import ObjectId
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from react_engine import run_react_loop, build_react_system_prompt
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="Payroll Agent", description="Salary and Compensation AI Agent", version="2.0.0")
+app = FastAPI(title="Payroll Agent", description="Salary and Compensation AI Agent ReAct", version="3.0.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
@@ -58,7 +60,7 @@ PAYROLL_ESCALATION_RESPONSE = (
     "Please contact hr@company.com or call +65 6123 4567."
 )
 
-PAYROLL_SYSTEM_PROMPT = """You are a Payroll AI Agent for ResourcefulAI. You have tools to look up real payroll data.
+_PAYROLL_SYSTEM_PROMPT_BASE = """You are a Payroll AI Agent for ResourcefulAI. You have tools to look up real payroll data.
 
 Always use tools to retrieve accurate information before answering. Do not guess salary figures.
 
@@ -66,6 +68,9 @@ GUARDRAILS:
 - Only show the requesting employee's own data — never another employee's
 - Do not approve salary changes or bonuses without manager approval
 - Do not provide tax advice or interpret tax law"""
+
+# Wrap with ReAct instruction
+PAYROLL_SYSTEM_PROMPT = build_react_system_prompt(_PAYROLL_SYSTEM_PROMPT_BASE)
 
 # ─────────────────────────────────────────────
 # Tool Definitions
@@ -343,53 +348,26 @@ async def query_payroll(request: PayrollQueryRequest):
             messages.append({"role": msg["role"], "content": msg["message"]})
         messages.append({"role": "user", "content": request.query})
 
-        # ── Agentic loop ──────────────────────────────────────────────────────
-        tools_used  = []
+        # ── Genuine ReAct loop ────────────────────────────────────────────────
         employee_data = None
-        max_iterations = 5
-
-        for iteration in range(max_iterations):
-            logger.info(f"🔄 Payroll agent iteration {iteration + 1}")
-            response = client.chat.completions.create(
-                model="gpt-4o-mini",
-                messages=messages,
-                tools=PAYROLL_TOOLS,
-                tool_choice="auto",
-                temperature=0.2,
-                max_tokens=600
-            )
-
-            msg = response.choices[0].message
-            messages.append(msg)
-
-            if not msg.tool_calls:
-                answer = msg.content.strip() if msg.content else "I was unable to generate a response."
-                logger.info(f"✅ Payroll agent done after {iteration + 1} iteration(s)")
-                await log_message(conv_id, "user",      request.query, request.employee_id)
-                await log_message(conv_id, "assistant", answer,        request.employee_id)
-                return PayrollQueryResponse(answer=answer, data=employee_data,
-                                            conversation_id=conv_id, tools_used=tools_used)
-
-            for tool_call in msg.tool_calls:
-                tool_name   = tool_call.function.name
-                tool_args   = json.loads(tool_call.function.arguments)
-                logger.info(f"🔧 Payroll calling tool: {tool_name}({tool_args})")
-                tool_result = await execute_tool(tool_name, tool_args)
-                tools_used.append(tool_name)
-
-                # Capture employee data for response metadata
-                if tool_name == "get_employee_info":
-                    try:
-                        employee_data = json.loads(tool_result)
-                    except Exception:
-                        pass
-
-                messages.append({"role": "tool", "tool_call_id": tool_call.id, "content": tool_result})
-
-        answer = "I reached the maximum reasoning steps. Please try rephrasing your question."
-        await log_message(conv_id, "user", request.query, request.employee_id)
-        await log_message(conv_id, "assistant", answer, request.employee_id)
-        return PayrollQueryResponse(answer=answer, data=None, conversation_id=conv_id, tools_used=tools_used)
+        result = await run_react_loop(
+            openai_client=client,
+            messages=messages,
+            tools=PAYROLL_TOOLS,
+            tool_executor=execute_tool,
+            service_name="Payroll",
+            max_iterations=8,
+        )
+        answer     = result["answer"]
+        tools_used = result["tools_used"]
+        logger.info(
+            f"✅ Payroll ReAct complete — {result['iterations']} iteration(s), "
+            f"tools: {tools_used}, thoughts logged: {len(result['thoughts'])}"
+        )
+        await log_message(conv_id, "user",      request.query, request.employee_id)
+        await log_message(conv_id, "assistant", answer,        request.employee_id)
+        return PayrollQueryResponse(answer=answer, data=employee_data,
+                                    conversation_id=conv_id, tools_used=tools_used)
 
     except HTTPException:
         raise

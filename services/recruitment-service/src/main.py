@@ -6,7 +6,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional, Dict, List
-import os, json, uuid, traceback
+import sys, os, json, uuid, traceback
 from dotenv import load_dotenv
 import logging
 from openai import OpenAI
@@ -14,6 +14,8 @@ from datetime import datetime
 import uvicorn
 from motor.motor_asyncio import AsyncIOMotorClient
 from bson import ObjectId
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from react_engine import run_react_loop, build_react_system_prompt
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -52,11 +54,7 @@ RECRUITMENT_ESCALATION_RESPONSE = (
     "Please contact hr@company.com or call +65 6123 4567."
 )
 
-RECRUITMENT_SYSTEM_PROMPT = """You are a professional Recruitment AI Agent for ResourcefulAI — a fair, data-driven, and professional virtual assistant supporting hiring processes.  You have tools to look up real job data.
-
-Answer the user’s recruitment-related query using ONLY the company recruitment policies provided.
-Provide guidance on hiring processes, candidate evaluation, or recruitment practices where applicable.
-If the query involves confidential information or restricted topics, do not answer and instead advise contacting HR.
+_RECRUITMENT_SYSTEM_PROMPT_BASE = """You are a Recruitment AI Agent for ResourcefulAI. You have tools to look up real job data.
 
 Use tools to retrieve accurate job information before answering. You can:
 - Search for open positions by department or location
@@ -69,6 +67,9 @@ GUARDRAILS:
 - Do not make discriminatory remarks about candidates
 - Do not commit to salary offers without HR approval
 - Provide fair, accurate information to all enquirers"""
+
+# Wrap with ReAct instruction
+RECRUITMENT_SYSTEM_PROMPT = build_react_system_prompt(_RECRUITMENT_SYSTEM_PROMPT_BASE)
 
 # ─────────────────────────────────────────────
 # Tool Definitions
@@ -331,51 +332,26 @@ async def query_recruitment(request: RecruitmentQueryRequest):
             messages.append({"role": msg["role"], "content": msg["message"]})
         messages.append({"role": "user", "content": request.query})
 
-        tools_used     = []
+        # ── Genuine ReAct loop ────────────────────────────────────────────
         job_data       = None
-        max_iterations = 5
-
-        for iteration in range(max_iterations):
-            logger.info(f"🔄 Recruitment agent iteration {iteration + 1}")
-            response = client.chat.completions.create(
-                model="gpt-4o-mini",
-                messages=messages,
-                tools=RECRUITMENT_TOOLS,
-                tool_choice="auto",
-                temperature=0.3,
-                max_tokens=600
-            )
-
-            msg = response.choices[0].message
-            messages.append(msg)
-
-            if not msg.tool_calls:
-                answer = msg.content.strip() if msg.content else "I was unable to generate a response."
-                logger.info(f"✅ Recruitment agent done after {iteration + 1} iteration(s)")
-                await log_message(conv_id, "user",      request.query, None)
-                await log_message(conv_id, "assistant", answer,        None)
-                return RecruitmentQueryResponse(answer=answer, data=job_data,
-                                                conversation_id=conv_id, tools_used=tools_used)
-
-            for tool_call in msg.tool_calls:
-                tool_name   = tool_call.function.name
-                tool_args   = json.loads(tool_call.function.arguments)
-                logger.info(f"🔧 Recruitment calling tool: {tool_name}({tool_args})")
-                tool_result = await execute_tool(tool_name, tool_args)
-                tools_used.append(tool_name)
-
-                if tool_name == "get_recruitment_stats":
-                    try:
-                        job_data = json.loads(tool_result)
-                    except Exception:
-                        pass
-
-                messages.append({"role": "tool", "tool_call_id": tool_call.id, "content": tool_result})
-
-        answer = "I reached the maximum reasoning steps. Please try rephrasing your question."
-        await log_message(conv_id, "user", request.query, None)
-        await log_message(conv_id, "assistant", answer, None)
-        return RecruitmentQueryResponse(answer=answer, data=None, conversation_id=conv_id, tools_used=tools_used)
+        result = await run_react_loop(
+            openai_client=client,
+            messages=messages,
+            tools=RECRUITMENT_TOOLS,
+            tool_executor=execute_tool,
+            service_name="Recruitment",
+            max_iterations=8,
+        )
+        answer     = result["answer"]
+        tools_used = result["tools_used"]
+        logger.info(
+            f"✅ Recruitment ReAct complete — {result['iterations']} iteration(s), "
+            f"tools: {tools_used}, thoughts: {len(result['thoughts'])}"
+        )
+        await log_message(conv_id, "user",      request.query, None)
+        await log_message(conv_id, "assistant", answer,        None)
+        return RecruitmentQueryResponse(answer=answer, data=job_data,
+                                            conversation_id=conv_id, tools_used=tools_used)
 
     except HTTPException:
         raise

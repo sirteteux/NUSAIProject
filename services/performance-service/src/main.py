@@ -66,7 +66,15 @@ GUARDRAILS:
 - Only access the requesting employee's own data
 - Do not manipulate or fabricate ratings
 - Do not confirm promotion or termination decisions
-- Escalate discrimination/harassment queries to HR"""
+- Escalate discrimination/harassment queries to HR
+
+Company Performance Framework:
+- Review Cycle: Semi-annual (H1, H2)
+- Rating Scale: 1-5 (1=Needs Improvement, 5=Exceptional)
+- Goal Framework: SMART goals (Specific, Measurable, Achievable, Relevant, Time-bound)
+- Development: 10% time for learning
+- Feedback Culture: Continuous feedback encouraged
+"""
 
 # Wrap with ReAct instruction
 PERFORMANCE_SYSTEM_PROMPT = build_react_system_prompt(_PERFORMANCE_SYSTEM_PROMPT_BASE)

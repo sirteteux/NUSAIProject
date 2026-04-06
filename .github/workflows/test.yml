@@ -5,7 +5,10 @@ on:
     branches: [ main, develop, feature/** ]
   pull_request:
     branches: [ main, develop ]
-  workflow_dispatch:
+  workflow_run:
+    workflows: [Docker Build & Push]
+    types:
+      - completed
 
 jobs:
   test-all:

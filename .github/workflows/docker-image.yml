@@ -7,7 +7,7 @@ on:
     workflows: [Test All Services]
     types:
     - completed
-  workflow_dispatch:
+  workflow_dispatch: 
 
 jobs:
   build-push-prod-image:

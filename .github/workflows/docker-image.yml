@@ -8,7 +8,7 @@ on:
     types:
     - completed
   workflow_dispatch: 
-
+  
 jobs:
   build-push-prod-image:
     runs-on: ubuntu-latest

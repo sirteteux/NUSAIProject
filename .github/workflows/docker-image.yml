@@ -27,9 +27,9 @@ jobs:
           script: |
             cd /home/ubuntu # Navigate to your application directory on the EC2 instance
             # Pull the latest images and restart containers
+            docker compose down
             docker system prune -f
             docker compose pull
-            docker compose down
             docker compose up -d --remove-orphans
             # Replace 'docker compose' with 'docker-compose' if using older versions
 

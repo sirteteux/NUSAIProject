@@ -1,8 +1,10 @@
 name: Docker Build & Push
 
 on:
-  push:
-    branches: ["main"]
+  workflow_run:
+    workflows: [Test All Services]
+    types:
+    - completed
   workflow_dispatch:
 
 jobs:
